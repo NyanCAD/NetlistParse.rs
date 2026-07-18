@@ -97,7 +97,15 @@ impl Lexer {
             chars.push(c);
         }
         offs.push(src.len());
-        Lexer { chars, offs, i: 0, tok_start: 0, tok_start_ci: 0, last_token, kw: KeywordTrie::new() }
+        Lexer {
+            chars,
+            offs,
+            i: 0,
+            tok_start: 0,
+            tok_start_ci: 0,
+            last_token,
+            kw: KeywordTrie::new(),
+        }
     }
 
     /// Tokenize the whole buffer, including the final `ENDMARKER`.
@@ -177,7 +185,11 @@ impl Lexer {
     }
 
     fn emit(&mut self, kind: TokenKind) -> RawTok {
-        let tok = RawTok { kind, start: self.tok_start as u32, end: self.position() as u32 };
+        let tok = RawTok {
+            kind,
+            start: self.tok_start as u32,
+            end: self.position() as u32,
+        };
         self.last_token = kind;
         self.start_token();
         tok
@@ -539,8 +551,14 @@ mod token_tests {
             ("6_Ohms", Some(&[NUMBER])),
             ("0.3MHz", Some(&[NUMBER])),
             ("MHz", Some(&[IDENTIFIER])),
-            ("a = 1 \\\nb=2", Some(&[IDENTIFIER, EQ, NUMBER, ESCD_NEWLINE, IDENTIFIER, EQ, NUMBER])),
-            ("name info info=foo", Some(&[IDENTIFIER, INFO, INFO, EQ, IDENTIFIER])),
+            (
+                "a = 1 \\\nb=2",
+                Some(&[IDENTIFIER, EQ, NUMBER, ESCD_NEWLINE, IDENTIFIER, EQ, NUMBER]),
+            ),
+            (
+                "name info info=foo",
+                Some(&[IDENTIFIER, INFO, INFO, EQ, IDENTIFIER]),
+            ),
             ("tran tran tran=tran", Some(&[TRAN, TRAN, TRAN, EQ, TRAN])),
             ("save save=foo", Some(&[SAVE, SAVE, EQ, IDENTIFIER])),
             ("* comment", None),
@@ -553,8 +571,12 @@ mod token_tests {
             .map(|t| t.kind)
             .filter(|k| !k.is_triv())
             .collect();
-        let expected: Vec<TokenKind> =
-            cases.iter().filter_map(|(_, e)| *e).flatten().copied().collect();
+        let expected: Vec<TokenKind> = cases
+            .iter()
+            .filter_map(|(_, e)| *e)
+            .flatten()
+            .copied()
+            .collect();
         assert_eq!(got, expected);
     }
 }

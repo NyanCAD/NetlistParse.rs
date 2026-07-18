@@ -249,7 +249,7 @@ pub enum TokenKind {
     NOT_EQ, // !=
 
     // Case equality
-    EQEQEQ,  // ===
+    EQEQEQ,   // ===
     NOT_EQEQ, // !==
 
     // Logical negation

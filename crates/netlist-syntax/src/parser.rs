@@ -92,8 +92,14 @@ impl<'a> Parser<'a> {
             raw,
             p: 0,
             started: false,
-            nt: Sig { idx: 0, kind: ERROR },
-            nnt: Sig { idx: 0, kind: ERROR },
+            nt: Sig {
+                idx: 0,
+                kind: ERROR,
+            },
+            nnt: Sig {
+                idx: 0,
+                kind: ERROR,
+            },
             emit_idx: 0,
             builder,
             errored: false,
@@ -167,7 +173,10 @@ impl<'a> Parser<'a> {
 
     fn next_sig(&mut self) -> Sig {
         let idx = self.get_next_action();
-        Sig { idx, kind: self.raw[idx].kind }
+        Sig {
+            idx,
+            kind: self.raw[idx].kind,
+        }
     }
 
     fn advance(&mut self) {
@@ -221,8 +230,10 @@ impl<'a> Parser<'a> {
         self.flush_trivia(self.nt.idx);
         let t = self.raw[self.nt.idx];
         if t.end > t.start {
-            self.builder
-                .token(to_raw(SyntaxKind::Skipped), &self.src[t.start as usize..t.end as usize]);
+            self.builder.token(
+                to_raw(SyntaxKind::Skipped),
+                &self.src[t.start as usize..t.end as usize],
+            );
         }
         self.emit_idx = self.nt.idx + 1;
         self.advance();
@@ -250,7 +261,11 @@ impl<'a> Parser<'a> {
         body: F,
     ) -> PResult {
         let r = body(self);
-        let kind = if r.is_ok() { ok_kind } else { SyntaxKind::Incomplete };
+        let kind = if r.is_ok() {
+            ok_kind
+        } else {
+            SyntaxKind::Incomplete
+        };
         self.builder.start_node_at(cp, to_raw(kind));
         self.builder.finish_node();
         r
@@ -261,10 +276,15 @@ impl<'a> Parser<'a> {
     /// inlined when it parses cleanly, but a failure re-wraps the accumulated
     /// elements in an `Incomplete` at the list level — one extra layer on top of
     /// the failing element's own `Incomplete`.
-    fn wrapped_on_err<F: FnOnce(&mut Self) -> PResult>(&mut self, cp: Checkpoint, body: F) -> PResult {
+    fn wrapped_on_err<F: FnOnce(&mut Self) -> PResult>(
+        &mut self,
+        cp: Checkpoint,
+        body: F,
+    ) -> PResult {
         let r = body(self);
         if r.is_err() {
-            self.builder.start_node_at(cp, to_raw(SyntaxKind::Incomplete));
+            self.builder
+                .start_node_at(cp, to_raw(SyntaxKind::Incomplete));
             self.builder.finish_node();
         }
         r
@@ -407,7 +427,8 @@ impl<'a> Parser<'a> {
 
 impl<'a> Parser<'a> {
     fn parse_toplevel(&mut self) {
-        self.builder.start_node(to_raw(SyntaxKind::SPICENetlistSource));
+        self.builder
+            .start_node(to_raw(SyntaxKind::SPICENetlistSource));
         while self.nt.kind != ENDMARKER {
             let _ = self.parse_spice_toplevel();
         }
@@ -422,7 +443,8 @@ impl<'a> Parser<'a> {
     /// stopped (the next byte the Spectre driver should resume emitting from).
     /// Mirrors `SPICENetlistCSTParser.parse`.
     fn parse_region(&mut self) -> u32 {
-        self.builder.start_node(to_raw(SyntaxKind::SPICENetlistSource));
+        self.builder
+            .start_node(to_raw(SyntaxKind::SPICENetlistSource));
         while self.nt.kind != ENDMARKER {
             let _ = self.parse_spice_toplevel();
             if self.return_on_language_change && self.lang_swapped {
@@ -740,8 +762,8 @@ impl<'a> Parser<'a> {
         let cp = self.checkpoint();
         self.wrapped(cp, SyntaxKind::MutualInductor, |p| {
             p.parse_hierarchial_node()?; // name
-            // Inductor references: every hier node except the last token, which
-            // is the coupling coefficient.
+                                         // Inductor references: every hier node except the last token, which
+                                         // is the coupling coefficient.
             while !p.eol() && p.nnt.kind != NEWLINE && p.nnt.kind != ENDMARKER {
                 p.parse_hierarchial_node()?;
             }
@@ -759,7 +781,7 @@ impl<'a> Parser<'a> {
             p.parse_hierarchial_node()?; // gate
             p.parse_hierarchial_node()?; // source
             p.parse_hierarchial_node()?; // model
-            // Optional positional area (a value, not a `param=`), then OFF flag.
+                                         // Optional positional area (a value, not a `param=`), then OFF flag.
             if !p.eol() && p.nt.kind != OFF && p.nnt.kind != EQ {
                 p.parse_expression()?; // area
             }
@@ -877,9 +899,7 @@ impl<'a> Parser<'a> {
                 }
                 // A bare identifier immediately before end-of-line is the
                 // model-after-params name → emit as a bare Identifier.
-                if p.nt.kind.is_ident()
-                    && (p.nnt.kind == NEWLINE || p.nnt.kind == ENDMARKER)
-                {
+                if p.nt.kind.is_ident() && (p.nnt.kind == NEWLINE || p.nnt.kind == ENDMARKER) {
                     p.bump(SyntaxKind::Identifier);
                     break;
                 }
@@ -1186,9 +1206,9 @@ impl<'a> Parser<'a> {
         self.wrapped(cp, SyntaxKind::Tran, |p| {
             p.take_kw(&[TRAN])?;
             p.take_literal()?; // tstep-or-tstop (required)
-            // up to three further literals (tstop/tstart/tmax) — all
-            // NumberLiterals in source order, so the Julia tstep/tstop
-            // relabeling doesn't affect the CST.
+                               // up to three further literals (tstop/tstart/tmax) — all
+                               // NumberLiterals in source order, so the Julia tstep/tstop
+                               // relabeling doesn't affect the CST.
             for _ in 0..3 {
                 if p.nt.kind.is_literal() {
                     p.take_literal()?;

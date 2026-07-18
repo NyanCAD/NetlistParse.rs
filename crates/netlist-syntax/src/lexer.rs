@@ -40,10 +40,10 @@ pub struct RawTok {
 
 // --- character classifiers (tokenize/lexer.jl) ---
 
-const INSTANCE_SPECIAL_START: &[char] =
-    &['~', '!', '@', '#', '%', '^', '&', '_', '<', '>', '?', '/', '|'];
-const INSTANCE_SPECIAL: &[char] =
-    &['$', '*', '-', '+', '{', '}', '[', ']', '\\', ';', ':'];
+const INSTANCE_SPECIAL_START: &[char] = &[
+    '~', '!', '@', '#', '%', '^', '&', '_', '<', '>', '?', '/', '|',
+];
+const INSTANCE_SPECIAL: &[char] = &['$', '*', '-', '+', '{', '}', '[', ']', '\\', ';', ':'];
 
 fn is_instance_start_char(c: char) -> bool {
     c.is_alphabetic() || c.is_ascii_digit() || INSTANCE_SPECIAL_START.contains(&c)
@@ -70,8 +70,31 @@ fn is_instance_first_char(c: char) -> bool {
     // instances instead of erroring — validated against ngspice/Xyce.
     matches!(
         c,
-        'A' | 'B' | 'C' | 'D' | 'E' | 'F' | 'G' | 'H' | 'I' | 'J' | 'K' | 'L' | 'M' | 'N' | 'O'
-            | 'P' | 'Q' | 'R' | 'S' | 'T' | 'U' | 'V' | 'W' | 'X' | 'Y' | 'Z'
+        'A' | 'B'
+            | 'C'
+            | 'D'
+            | 'E'
+            | 'F'
+            | 'G'
+            | 'H'
+            | 'I'
+            | 'J'
+            | 'K'
+            | 'L'
+            | 'M'
+            | 'N'
+            | 'O'
+            | 'P'
+            | 'Q'
+            | 'R'
+            | 'S'
+            | 'T'
+            | 'U'
+            | 'V'
+            | 'W'
+            | 'X'
+            | 'Y'
+            | 'Z'
     )
 }
 
@@ -267,7 +290,11 @@ impl Lexer {
     }
 
     fn emit(&mut self, kind: TokenKind) -> RawTok {
-        let tok = RawTok { kind, start: self.tok_start as u32, end: self.position() as u32 };
+        let tok = RawTok {
+            kind,
+            start: self.tok_start as u32,
+            end: self.position() as u32,
+        };
         self.last_token = kind;
         if !kind.is_triv() {
             self.lexed_nontriv_token_line = true;
@@ -367,9 +394,7 @@ impl Lexer {
             self.lex_bar()
         } else if c == '\'' && self.spice_dialect == Dialect::Pspice {
             self.lex_number()
-        } else if c == '\'' {
-            self.lex_prime()
-        } else if c == '"' {
+        } else if c == '\'' || c == '"' {
             self.lex_prime()
         } else if c == '%' {
             self.emit(PERCENT)
@@ -672,9 +697,7 @@ impl Lexer {
     }
 
     fn lex_quote(&mut self) -> RawTok {
-        if self.accept_ch('"') || self.accept_ch('\'') {
-            self.emit(STRING)
-        } else if self.read_string() {
+        if self.accept_ch('"') || self.accept_ch('\'') || self.read_string() {
             self.emit(STRING)
         } else {
             self.emit(EOF_STRING)
@@ -798,73 +821,230 @@ mod token_tests {
     #[test]
     fn julia_tokenize_table() {
         let cases: &[(&str, &[TokenKind])] = &[
-            (".TITLE THIS IS A TILE WITH \u{a4}%&/)/& stuff", &[DOT, TITLE, TITLE_LINE]),
-            ("Vv-_-{} A B 0", &[IDENTIFIER_VOLTAGE, IDENTIFIER, IDENTIFIER, NUMBER]),
+            (
+                ".TITLE THIS IS A TILE WITH \u{a4}%&/)/& stuff",
+                &[DOT, TITLE, TITLE_LINE],
+            ),
+            (
+                "Vv-_-{} A B 0",
+                &[IDENTIFIER_VOLTAGE, IDENTIFIER, IDENTIFIER, NUMBER],
+            ),
             ("* MOSFET", &[]),
             (".GLOBAL VDD NET1", &[DOT, GLOBAL, IDENTIFIER, IDENTIFIER]),
-            (".MODEL BJT_modName NPN (BF=val)", &[DOT, MODEL, IDENTIFIER, IDENTIFIER, IDENTIFIER, EQ, VAL]),
-            ("Rname N1 N2 0.1 $ comment", &[IDENTIFIER_RESISTOR, IDENTIFIER, IDENTIFIER, NUMBER]),
+            (
+                ".MODEL BJT_modName NPN (BF=val)",
+                &[DOT, MODEL, IDENTIFIER, IDENTIFIER, IDENTIFIER, EQ, VAL],
+            ),
+            (
+                "Rname N1 N2 0.1 $ comment",
+                &[IDENTIFIER_RESISTOR, IDENTIFIER, IDENTIFIER, NUMBER],
+            ),
             ("sky130.0", &[IDENTIFIER_SWITCH, DOT, NUMBER]),
-            (".param freq = 1Meg", &[DOT, PARAMETERS, IDENTIFIER, EQ, NUMBER]),
-            (".parameter freq = 1Meg", &[DOT, PARAMETERS, IDENTIFIER, EQ, NUMBER]),
+            (
+                ".param freq = 1Meg",
+                &[DOT, PARAMETERS, IDENTIFIER, EQ, NUMBER],
+            ),
+            (
+                ".parameter freq = 1Meg",
+                &[DOT, PARAMETERS, IDENTIFIER, EQ, NUMBER],
+            ),
             ("*comment", &[]),
             ("    *comment", &[]),
             (";comment", &[]),
             ("    ;comment", &[]),
             ("1    ;comment", &[NUMBER]),
             ("{1*1}", &[LBRACE, NUMBER, STAR, NUMBER, RBRACE]),
-            (".lib 'with spaces/sm141064.ngspice' nmos_6p0_t", &[DOT, LIB, STRING, IDENTIFIER]),
-            (".lib sm141064.ngspice nmos_6p0_t", &[DOT, LIB, IDENTIFIER, IDENTIFIER]),
+            (
+                ".lib 'with spaces/sm141064.ngspice' nmos_6p0_t",
+                &[DOT, LIB, STRING, IDENTIFIER],
+            ),
+            (
+                ".lib sm141064.ngspice nmos_6p0_t",
+                &[DOT, LIB, IDENTIFIER, IDENTIFIER],
+            ),
             (".include ./foo", &[DOT, INCLUDE, IDENTIFIER]),
             (".include './foo.bar'", &[DOT, INCLUDE, STRING]),
             (
                 ".param r_l='s*(r_length-2*r_dl)'",
-                &[DOT, PARAMETERS, IDENTIFIER, EQ, PRIME, IDENTIFIER, STAR, LPAREN, IDENTIFIER, MINUS, NUMBER, STAR, IDENTIFIER, RPAREN, PRIME],
+                &[
+                    DOT, PARAMETERS, IDENTIFIER, EQ, PRIME, IDENTIFIER, STAR, LPAREN, IDENTIFIER,
+                    MINUS, NUMBER, STAR, IDENTIFIER, RPAREN, PRIME,
+                ],
             ),
-            ("Q1 Net-_Q1-C_ Net-_Q1-B_ 0 BC546B", &[IDENTIFIER_BIPOLAR_TRANSISTOR, IDENTIFIER, IDENTIFIER, NUMBER, IDENTIFIER]),
+            (
+                "Q1 Net-_Q1-C_ Net-_Q1-B_ 0 BC546B",
+                &[
+                    IDENTIFIER_BIPOLAR_TRANSISTOR,
+                    IDENTIFIER,
+                    IDENTIFIER,
+                    NUMBER,
+                    IDENTIFIER,
+                ],
+            ),
             (
                 "X1 v+ v- r={a-b} f-o-o=1",
-                &[IDENTIFIER_SUBCIRCUIT_CALL, IDENTIFIER, IDENTIFIER, IDENTIFIER, EQ, LBRACE, IDENTIFIER, MINUS, IDENTIFIER, RBRACE, IDENTIFIER, EQ, NUMBER],
+                &[
+                    IDENTIFIER_SUBCIRCUIT_CALL,
+                    IDENTIFIER,
+                    IDENTIFIER,
+                    IDENTIFIER,
+                    EQ,
+                    LBRACE,
+                    IDENTIFIER,
+                    MINUS,
+                    IDENTIFIER,
+                    RBRACE,
+                    IDENTIFIER,
+                    EQ,
+                    NUMBER,
+                ],
             ),
             (
                 ".ic v( m_tn4:d )=  1.225e-08",
-                &[DOT, IC, VAL, LPAREN, IDENTIFIER, COLON, IDENTIFIER, RPAREN, EQ, NUMBER],
+                &[
+                    DOT, IC, VAL, LPAREN, IDENTIFIER, COLON, IDENTIFIER, RPAREN, EQ, NUMBER,
+                ],
             ),
-            ("V1 vin 0 SIN (0, 1, 1k)", &[IDENTIFIER_VOLTAGE, IDENTIFIER, NUMBER, SIN, NUMBER, NUMBER, NUMBER]),
+            (
+                "V1 vin 0 SIN (0, 1, 1k)",
+                &[
+                    IDENTIFIER_VOLTAGE,
+                    IDENTIFIER,
+                    NUMBER,
+                    SIN,
+                    NUMBER,
+                    NUMBER,
+                    NUMBER,
+                ],
+            ),
             (
                 "R1 (a b) r=\"foo+bar\"",
-                &[IDENTIFIER_RESISTOR, IDENTIFIER, IDENTIFIER, IDENTIFIER, EQ, PRIME, IDENTIFIER, PLUS, IDENTIFIER, PRIME],
+                &[
+                    IDENTIFIER_RESISTOR,
+                    IDENTIFIER,
+                    IDENTIFIER,
+                    IDENTIFIER,
+                    EQ,
+                    PRIME,
+                    IDENTIFIER,
+                    PLUS,
+                    IDENTIFIER,
+                    PRIME,
+                ],
             ),
             (
                 ".MEAS TRAN res1 FIND V(out) AT=5m",
-                &[DOT, MEASURE, TRAN, IDENTIFIER, FIND, VAL, LPAREN, IDENTIFIER, RPAREN, AT, EQ, NUMBER],
+                &[
+                    DOT, MEASURE, TRAN, IDENTIFIER, FIND, VAL, LPAREN, IDENTIFIER, RPAREN, AT, EQ,
+                    NUMBER,
+                ],
             ),
             (".tran 1ns 60ns", &[DOT, TRAN, NUMBER, NUMBER]),
             (".model 1N3064 D", &[DOT, MODEL, NUMBER, IDENTIFIER]),
             ("2N2222", &[NUMBER]),
-            ("R1 n1 n2 r={1.5e-3}", &[IDENTIFIER_RESISTOR, IDENTIFIER, IDENTIFIER, IDENTIFIER, EQ, LBRACE, NUMBER, RBRACE]),
+            (
+                "R1 n1 n2 r={1.5e-3}",
+                &[
+                    IDENTIFIER_RESISTOR,
+                    IDENTIFIER,
+                    IDENTIFIER,
+                    IDENTIFIER,
+                    EQ,
+                    LBRACE,
+                    NUMBER,
+                    RBRACE,
+                ],
+            ),
             (
                 "R2 n1 n2 r={1foe-bar}",
-                &[IDENTIFIER_RESISTOR, IDENTIFIER, IDENTIFIER, IDENTIFIER, EQ, LBRACE, NUMBER, MINUS, IDENTIFIER, RBRACE],
+                &[
+                    IDENTIFIER_RESISTOR,
+                    IDENTIFIER,
+                    IDENTIFIER,
+                    IDENTIFIER,
+                    EQ,
+                    LBRACE,
+                    NUMBER,
+                    MINUS,
+                    IDENTIFIER,
+                    RBRACE,
+                ],
             ),
-            ("C1 n1 n2 1.5e-12F", &[IDENTIFIER_CAPACITOR, IDENTIFIER, IDENTIFIER, NUMBER]),
-            (".OPTIONS montequantiles=[0.134 99.865]", &[DOT, OPTIONS, IDENTIFIER, EQ, LSQUARE, NUMBER, NUMBER, RSQUARE]),
-            (".param vals=[1 2 3]", &[DOT, PARAMETERS, IDENTIFIER, EQ, LSQUARE, NUMBER, NUMBER, NUMBER, RSQUARE]),
-            (".OPTIONS someopt=[1,2]", &[DOT, OPTIONS, IDENTIFIER, EQ, LSQUARE, NUMBER, COMMA, NUMBER, RSQUARE]),
-            (".param x=[1.5e-3]", &[DOT, PARAMETERS, IDENTIFIER, EQ, LSQUARE, NUMBER, RSQUARE]),
+            (
+                "C1 n1 n2 1.5e-12F",
+                &[IDENTIFIER_CAPACITOR, IDENTIFIER, IDENTIFIER, NUMBER],
+            ),
+            (
+                ".OPTIONS montequantiles=[0.134 99.865]",
+                &[
+                    DOT, OPTIONS, IDENTIFIER, EQ, LSQUARE, NUMBER, NUMBER, RSQUARE,
+                ],
+            ),
+            (
+                ".param vals=[1 2 3]",
+                &[
+                    DOT, PARAMETERS, IDENTIFIER, EQ, LSQUARE, NUMBER, NUMBER, NUMBER, RSQUARE,
+                ],
+            ),
+            (
+                ".OPTIONS someopt=[1,2]",
+                &[
+                    DOT, OPTIONS, IDENTIFIER, EQ, LSQUARE, NUMBER, COMMA, NUMBER, RSQUARE,
+                ],
+            ),
+            (
+                ".param x=[1.5e-3]",
+                &[DOT, PARAMETERS, IDENTIFIER, EQ, LSQUARE, NUMBER, RSQUARE],
+            ),
             ("123'hAB", &[NUMBER]),
             ("8'hFF", &[NUMBER]),
             ("4'b1010", &[NUMBER]),
             ("8'o377", &[NUMBER]),
             ("16'h1234", &[NUMBER]),
-            (".param myval=123'hAB", &[DOT, PARAMETERS, IDENTIFIER, EQ, NUMBER]),
+            (
+                ".param myval=123'hAB",
+                &[DOT, PARAMETERS, IDENTIFIER, EQ, NUMBER],
+            ),
             (
                 "EOS 7 1 POLY(1) 16 49 2E-3 1",
-                &[IDENTIFIER_VOLTAGE_CONTROLLED_VOLTAGE, NUMBER, NUMBER, POLY, NUMBER, NUMBER, NUMBER, NUMBER, NUMBER],
+                &[
+                    IDENTIFIER_VOLTAGE_CONTROLLED_VOLTAGE,
+                    NUMBER,
+                    NUMBER,
+                    POLY,
+                    NUMBER,
+                    NUMBER,
+                    NUMBER,
+                    NUMBER,
+                    NUMBER,
+                ],
             ),
             (
                 "GD16 16 1 TABLE {V(16,1)} ((-100,-1p)(0,0)(1m,1u)(2m,1m))",
-                &[IDENTIFIER_VOLTAGE_CONTROLLED_CURRENT, NUMBER, NUMBER, TABLE, LBRACE, VAL, LPAREN, NUMBER, COMMA, NUMBER, RPAREN, RBRACE, MINUS, NUMBER, MINUS, NUMBER, NUMBER, NUMBER, NUMBER, NUMBER, NUMBER, NUMBER],
+                &[
+                    IDENTIFIER_VOLTAGE_CONTROLLED_CURRENT,
+                    NUMBER,
+                    NUMBER,
+                    TABLE,
+                    LBRACE,
+                    VAL,
+                    LPAREN,
+                    NUMBER,
+                    COMMA,
+                    NUMBER,
+                    RPAREN,
+                    RBRACE,
+                    MINUS,
+                    NUMBER,
+                    MINUS,
+                    NUMBER,
+                    NUMBER,
+                    NUMBER,
+                    NUMBER,
+                    NUMBER,
+                    NUMBER,
+                    NUMBER,
+                ],
             ),
             ("", &[]),
         ];
@@ -898,12 +1078,27 @@ mod operator_dialect_tests {
         // Braces put the lexer in expression mode so operator chars lex as
         // operators rather than instance-name characters.
         let cases: &[(&str, &[TokenKind])] = &[
-            ("{a<<b}", &[LBRACE, IDENTIFIER, LBITSHIFT, IDENTIFIER, RBRACE]),
-            ("{a>>b}", &[LBRACE, IDENTIFIER, RBITSHIFT, IDENTIFIER, RBRACE]),
-            ("{a<<<b}", &[LBRACE, IDENTIFIER, LBITSHIFT_A, IDENTIFIER, RBRACE]),
-            ("{a>>>b}", &[LBRACE, IDENTIFIER, RRBITSHIFT_A, IDENTIFIER, RBRACE]),
+            (
+                "{a<<b}",
+                &[LBRACE, IDENTIFIER, LBITSHIFT, IDENTIFIER, RBRACE],
+            ),
+            (
+                "{a>>b}",
+                &[LBRACE, IDENTIFIER, RBITSHIFT, IDENTIFIER, RBRACE],
+            ),
+            (
+                "{a<<<b}",
+                &[LBRACE, IDENTIFIER, LBITSHIFT_A, IDENTIFIER, RBRACE],
+            ),
+            (
+                "{a>>>b}",
+                &[LBRACE, IDENTIFIER, RRBITSHIFT_A, IDENTIFIER, RBRACE],
+            ),
             ("{a<=b}", &[LBRACE, IDENTIFIER, LESS_EQ, IDENTIFIER, RBRACE]),
-            ("{a>=b}", &[LBRACE, IDENTIFIER, GREATER_EQ, IDENTIFIER, RBRACE]),
+            (
+                "{a>=b}",
+                &[LBRACE, IDENTIFIER, GREATER_EQ, IDENTIFIER, RBRACE],
+            ),
             ("{a<b}", &[LBRACE, IDENTIFIER, LESS, IDENTIFIER, RBRACE]),
             ("{a>b}", &[LBRACE, IDENTIFIER, GREATER, IDENTIFIER, RBRACE]),
             ("{a<+b}", &[LBRACE, IDENTIFIER, CASSIGN, IDENTIFIER, RBRACE]),
@@ -912,19 +1107,45 @@ mod operator_dialect_tests {
             ("{a!=b}", &[LBRACE, IDENTIFIER, NOT_EQ, IDENTIFIER, RBRACE]),
             ("{a!==b}", &[LBRACE, IDENTIFIER, NOT_IS, IDENTIFIER, RBRACE]),
             ("{!a}", &[LBRACE, NOT, IDENTIFIER, RBRACE]),
-            ("{a&&b}", &[LBRACE, IDENTIFIER, LAZY_AND, IDENTIFIER, RBRACE]),
+            (
+                "{a&&b}",
+                &[LBRACE, IDENTIFIER, LAZY_AND, IDENTIFIER, RBRACE],
+            ),
             ("{a||b}", &[LBRACE, IDENTIFIER, LAZY_OR, IDENTIFIER, RBRACE]),
             ("{a&b}", &[LBRACE, IDENTIFIER, AND, IDENTIFIER, RBRACE]),
             ("{a|b}", &[LBRACE, IDENTIFIER, OR, IDENTIFIER, RBRACE]),
             ("{a^b}", &[LBRACE, IDENTIFIER, XOR, IDENTIFIER, RBRACE]),
             ("{~a}", &[LBRACE, TILDE, IDENTIFIER, RBRACE]),
-            ("{a^~b}", &[LBRACE, IDENTIFIER, XOR_TILDE, IDENTIFIER, RBRACE]),
-            ("{a~^b}", &[LBRACE, IDENTIFIER, TILDE_XOR, IDENTIFIER, RBRACE]),
-            ("{a~&b}", &[LBRACE, IDENTIFIER, TILDE_AND, IDENTIFIER, RBRACE]),
+            (
+                "{a^~b}",
+                &[LBRACE, IDENTIFIER, XOR_TILDE, IDENTIFIER, RBRACE],
+            ),
+            (
+                "{a~^b}",
+                &[LBRACE, IDENTIFIER, TILDE_XOR, IDENTIFIER, RBRACE],
+            ),
+            (
+                "{a~&b}",
+                &[LBRACE, IDENTIFIER, TILDE_AND, IDENTIFIER, RBRACE],
+            ),
             ("{a~|b}", &[LBRACE, IDENTIFIER, TILD_OR, IDENTIFIER, RBRACE]),
             ("{a%b}", &[LBRACE, IDENTIFIER, PERCENT, IDENTIFIER, RBRACE]),
-            ("{a**b}", &[LBRACE, IDENTIFIER, STAR_STAR, IDENTIFIER, RBRACE]),
-            ("{a?b:c}", &[LBRACE, IDENTIFIER, CONDITIONAL, IDENTIFIER, COLON, IDENTIFIER, RBRACE]),
+            (
+                "{a**b}",
+                &[LBRACE, IDENTIFIER, STAR_STAR, IDENTIFIER, RBRACE],
+            ),
+            (
+                "{a?b:c}",
+                &[
+                    LBRACE,
+                    IDENTIFIER,
+                    CONDITIONAL,
+                    IDENTIFIER,
+                    COLON,
+                    IDENTIFIER,
+                    RBRACE,
+                ],
+            ),
             ("{a/b}", &[LBRACE, IDENTIFIER, SLASH, IDENTIFIER, RBRACE]),
         ];
         for (src, expected) in cases {
@@ -944,31 +1165,61 @@ mod operator_dialect_tests {
     fn dialect_instance_letters() {
         // hspice: P=port, S=s-parameter, W=transmission line.
         assert_eq!(kinds_d("P1 a b tl", Dialect::Hspice)[0], IDENTIFIER_PORT);
-        assert_eq!(kinds_d("S1 a b m", Dialect::Hspice)[0], IDENTIFIER_S_PARAMETER_ELEMENT);
-        assert_eq!(kinds_d("W1 a b tl", Dialect::Hspice)[0], IDENTIFIER_TRANSMISSION_LINE);
+        assert_eq!(
+            kinds_d("S1 a b m", Dialect::Hspice)[0],
+            IDENTIFIER_S_PARAMETER_ELEMENT
+        );
+        assert_eq!(
+            kinds_d("W1 a b tl", Dialect::Hspice)[0],
+            IDENTIFIER_TRANSMISSION_LINE
+        );
         // ngspice: P=transmission line (CPL), W=switch, Y=transmission, N=OSDI.
-        assert_eq!(kinds_d("P1 a b", Dialect::Ngspice)[0], IDENTIFIER_TRANSMISSION_LINE);
+        assert_eq!(
+            kinds_d("P1 a b", Dialect::Ngspice)[0],
+            IDENTIFIER_TRANSMISSION_LINE
+        );
         assert_eq!(kinds_d("W1 a b", Dialect::Ngspice)[0], IDENTIFIER_SWITCH);
-        assert_eq!(kinds_d("Y1 a b", Dialect::Ngspice)[0], IDENTIFIER_TRANSMISSION_LINE);
+        assert_eq!(
+            kinds_d("Y1 a b", Dialect::Ngspice)[0],
+            IDENTIFIER_TRANSMISSION_LINE
+        );
         assert_eq!(kinds_d("N1 a b m", Dialect::Ngspice)[0], IDENTIFIER_OSDI);
         // xyce: Y=OSDI.
         assert_eq!(kinds_d("Y1 a b m", Dialect::Xyce)[0], IDENTIFIER_OSDI);
         // other instance letters (J JFET, K mutual, T/U tline).
         assert_eq!(kinds_d("J1 a b m", Dialect::Ngspice)[0], IDENTIFIER_JFET);
-        assert_eq!(kinds_d("K1 l1 l2 1", Dialect::Ngspice)[0], IDENTIFIER_LINEAR_MUTUAL_INDUCTOR);
-        assert_eq!(kinds_d("T1 a b c d", Dialect::Ngspice)[0], IDENTIFIER_TRANSMISSION_LINE);
-        assert_eq!(kinds_d("U1 a b", Dialect::Ngspice)[0], IDENTIFIER_TRANSMISSION_LINE);
+        assert_eq!(
+            kinds_d("K1 l1 l2 1", Dialect::Ngspice)[0],
+            IDENTIFIER_LINEAR_MUTUAL_INDUCTOR
+        );
+        assert_eq!(
+            kinds_d("T1 a b c d", Dialect::Ngspice)[0],
+            IDENTIFIER_TRANSMISSION_LINE
+        );
+        assert_eq!(
+            kinds_d("U1 a b", Dialect::Ngspice)[0],
+            IDENTIFIER_TRANSMISSION_LINE
+        );
         // We extend Julia's is_instance_first_char with 'A'/'O'/'Z' so their
         // real ngspice devices lex as instances (A = XSPICE, O = LTRA, Z = MESFET).
-        assert_eq!(kinds_d("A1 in out m", Dialect::Ngspice)[0], IDENTIFIER_XSPICE);
-        assert_eq!(kinds_d("O1 a b", Dialect::Ngspice)[0], IDENTIFIER_TRANSMISSION_LINE);
+        assert_eq!(
+            kinds_d("A1 in out m", Dialect::Ngspice)[0],
+            IDENTIFIER_XSPICE
+        );
+        assert_eq!(
+            kinds_d("O1 a b", Dialect::Ngspice)[0],
+            IDENTIFIER_TRANSMISSION_LINE
+        );
         assert_eq!(kinds_d("Z1 a b", Dialect::Ngspice)[0], IDENTIFIER_HFET_MESA);
     }
 
     #[test]
     fn pspice_logic_literal() {
         // pspice `'0`/`'1` logic literals lex as numbers.
-        assert_eq!(kinds_d("{'0}", Dialect::Pspice), vec![LBRACE, NUMBER, RBRACE]);
+        assert_eq!(
+            kinds_d("{'0}", Dialect::Pspice),
+            vec![LBRACE, NUMBER, RBRACE]
+        );
     }
 
     #[test]
@@ -986,7 +1237,10 @@ mod operator_dialect_tests {
             .into_iter()
             .map(|t| t.kind)
             .collect();
-        assert!(toks.contains(&ESCD_NEWLINE), "expected ESCD_NEWLINE in {toks:?}");
+        assert!(
+            toks.contains(&ESCD_NEWLINE),
+            "expected ESCD_NEWLINE in {toks:?}"
+        );
         assert_eq!(kinds("\\foo"), vec![IDENTIFIER]);
     }
 
@@ -994,7 +1248,10 @@ mod operator_dialect_tests {
     fn unterminated_string_after_include() {
         // After .include, an unterminated quote is an EOF_STRING.
         let toks = kinds(".include \"foo");
-        assert!(toks.contains(&EOF_STRING), "expected EOF_STRING in {toks:?}");
+        assert!(
+            toks.contains(&EOF_STRING),
+            "expected EOF_STRING in {toks:?}"
+        );
     }
 
     #[test]
@@ -1004,6 +1261,9 @@ mod operator_dialect_tests {
             .into_iter()
             .map(|t| t.kind)
             .collect();
-        assert!(toks.contains(&JULIA_ESCAPE_BEGIN), "expected JULIA_ESCAPE_BEGIN in {toks:?}");
+        assert!(
+            toks.contains(&JULIA_ESCAPE_BEGIN),
+            "expected JULIA_ESCAPE_BEGIN in {toks:?}"
+        );
     }
 }

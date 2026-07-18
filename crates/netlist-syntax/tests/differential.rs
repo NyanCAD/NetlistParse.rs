@@ -10,8 +10,7 @@ use std::path::PathBuf;
 
 fn corpus_dir() -> PathBuf {
     // crates/netlist-syntax/tests -> ../../tests/{corpus,expected}
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests")
 }
 
 fn check_dialect(name: &str, dialect: netlist_syntax::Dialect) {

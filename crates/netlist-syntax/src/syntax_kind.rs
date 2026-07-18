@@ -230,8 +230,7 @@ impl TokenKind {
     /// `is_ident`: an identifier token *or* a keyword (SPICE lets keywords act
     /// as identifiers, e.g. node names).
     pub fn is_ident(self) -> bool {
-        (begin_identifiers.ord() < self.ord() && self.ord() < end_identifiers.ord())
-            || self.is_kw()
+        (begin_identifiers.ord() < self.ord() && self.ord() < end_identifiers.ord()) || self.is_kw()
     }
 
     pub fn is_operator(self) -> bool {

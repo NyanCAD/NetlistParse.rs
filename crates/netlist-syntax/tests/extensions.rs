@@ -44,7 +44,10 @@ fn extended_devices() {
     has_kind("* t\nJ1 d g s jmod\n", SyntaxKind::JFET);
     clean("* t\nO1 1 0 2 0 omod\n");
     has_kind("* t\nO1 1 0 2 0 omod\n", SyntaxKind::TransmissionLine);
-    has_kind("* t\nT1 1 0 2 0 Z0=50 TD=1n\n", SyntaxKind::TransmissionLine);
+    has_kind(
+        "* t\nT1 1 0 2 0 Z0=50 TD=1n\n",
+        SyntaxKind::TransmissionLine,
+    );
     clean("* t\nZ1 d g s zmod\n");
     has_kind("* t\nZ1 d g s zmod\n", SyntaxKind::Mesfet);
     clean("* t\nA1 in out gain_block\n");

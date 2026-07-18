@@ -11,7 +11,9 @@ use rowan::{NodeOrToken, TextSize};
 
 /// Content span `[start, end)` of an element: the byte range from its first to
 /// its last non-trivia descendant token. `None` if it contains no such token.
-fn content_span(elem: &NodeOrToken<SyntaxNode, crate::syntax_kind::SyntaxToken>) -> Option<(u32, u32)> {
+fn content_span(
+    elem: &NodeOrToken<SyntaxNode, crate::syntax_kind::SyntaxToken>,
+) -> Option<(u32, u32)> {
     match elem {
         NodeOrToken::Token(t) => {
             let k = t.kind();

@@ -628,7 +628,11 @@ fn project_spice_device(child: SyntaxNode) -> Option<ffi::SpiceDevice> {
         SyntaxKind::JFET => ast::JFET::cast(child).map(|j| ffi::SpiceDevice {
             kind: ffi::SpiceDeviceKind::Jfet,
             name: hier_text(j.name()),
-            nodes: vec![hier_text(j.drain()), hier_text(j.gate()), hier_text(j.source())],
+            nodes: vec![
+                hier_text(j.drain()),
+                hier_text(j.gate()),
+                hier_text(j.source()),
+            ],
             value: j.area().map(|e| e.text()).unwrap_or_default(),
             model: hier_text(j.model()),
             params: j.params().map(|p| project_spice_param(&p)).collect(),
@@ -879,7 +883,11 @@ fn collect_errors(root: &SyntaxNode) -> Vec<ffi::ParseError> {
 }
 
 pub fn parse_netlist(src: &str, start_spice: bool) -> ffi::Netlist {
-    let lang = if start_spice { StartLang::Spice } else { StartLang::Spectre };
+    let lang = if start_spice {
+        StartLang::Spice
+    } else {
+        StartLang::Spectre
+    };
     let root = parse_spectre_with(src, lang);
     let errors = collect_errors(&root);
     let source = sast::SpectreNetlistSource::cast(root).expect("root is SpectreNetlistSource");
@@ -1003,7 +1011,10 @@ mod tests {
         assert_eq!(v.source.ac_mag, "1");
         assert_eq!(v.source.ac_phase, "");
         assert_eq!(v.source.tran_kind.to_lowercase(), "pulse");
-        assert_eq!(v.source.tran_args, vec!["0", "5", "1m", "1u", "1u", "4m", "10m"]);
+        assert_eq!(
+            v.source.tran_args,
+            vec!["0", "5", "1m", "1u", "1u", "4m", "10m"]
+        );
         // I1
         let cur = d.iter().find(|x| x.name == "I1").unwrap();
         assert_eq!(cur.kind, super::ffi::SpiceDeviceKind::ISource);
@@ -1066,8 +1077,14 @@ mod tests {
         let nl = super::parse_netlist("* t\nQ1\nX1\n", true);
         // Must not panic; any devices that project should have empty nodes/model.
         for dev in &nl.spice_blocks[0].devices {
-            assert!(dev.nodes.is_empty(), "malformed device should have no nodes");
-            assert!(dev.model.is_empty(), "malformed device should have no model");
+            assert!(
+                dev.nodes.is_empty(),
+                "malformed device should have no nodes"
+            );
+            assert!(
+                dev.model.is_empty(),
+                "malformed device should have no model"
+            );
         }
     }
 
@@ -1128,12 +1145,20 @@ mod tests {
             .include \"models.spice\"\n\
             .lib \"mylib.sp\" tt\n";
         let nl = super::parse_netlist(src, true);
-        assert!(nl.errors.is_empty(), "unexpected parse errors: {} error(s)", nl.errors.len());
+        assert!(
+            nl.errors.is_empty(),
+            "unexpected parse errors: {} error(s)",
+            nl.errors.len()
+        );
         let b = &nl.spice_blocks[0];
         // 17 device lines (R C L V I D M Q X E G F H K S B J)
-        assert_eq!(b.devices.len(), 17, "expected 17 devices, got {}: {:?}",
+        assert_eq!(
             b.devices.len(),
-            b.devices.iter().map(|d| &d.name).collect::<Vec<_>>());
+            17,
+            "expected 17 devices, got {}: {:?}",
+            b.devices.len(),
+            b.devices.iter().map(|d| &d.name).collect::<Vec<_>>()
+        );
         // .include + .lib → 2 includes
         assert_eq!(b.includes.len(), 2);
         assert_eq!(b.includes[0].path, "models.spice");
@@ -1158,6 +1183,9 @@ mod tests {
         // Start in Spectre: the same leading SPICE line `R1 a b 1k` is invalid
         // Spectre and produces error node(s).
         let spectre = parse_netlist(src, /*start_spice=*/ false);
-        assert!(!spectre.errors.is_empty(), "spectre-start should error on the SPICE line");
+        assert!(
+            !spectre.errors.is_empty(),
+            "spectre-start should error on the SPICE line"
+        );
     }
 }

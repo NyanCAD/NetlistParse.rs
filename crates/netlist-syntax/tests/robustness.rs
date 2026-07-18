@@ -38,7 +38,7 @@ fn malformed_and_edge_inputs_are_lossless() {
         // --- incomplete / malformed dot-commands ---
         "* t\n.model foo\n",
         "* t\n.subckt\n",
-        "* t\n.subckt s a b\n",             // no .ends before EOF
+        "* t\n.subckt s a b\n", // no .ends before EOF
         "* t\n.param x =\n",
         "* t\n.param\n",
         "* t\n.dc\n",
@@ -57,9 +57,9 @@ fn malformed_and_edge_inputs_are_lossless() {
         "* t\n.data\n",
         "* t\n.data blk a\n",
         "* t\n.if\n",
-        "* t\n.if (1)\nR1 a b 1k\n",       // no .endif
+        "* t\n.if (1)\nR1 a b 1k\n", // no .endif
         "* t\n.lib\n",
-        "* t\n.lib mylib\nR1 a b 1k\n",     // no .endl before EOF
+        "* t\n.lib mylib\nR1 a b 1k\n", // no .endl before EOF
         "* t\n.measure\n",
         "* t\n.measure tran\n",
         "* t\n.measure tran nm find\n",
@@ -77,30 +77,30 @@ fn malformed_and_edge_inputs_are_lossless() {
         "* t\n.param x = a ? b\n",
         "* t\n.param x = [1 2\n",
         // --- valid edge cases (success sub-branches) ---
-        "* t\n.param x = [1 2 3]\n",         // array literal
-        "* t\n.param x = a ? b : c\n",       // full ternary
-        "* t\nV1 a 0 DC=5 AC=1 90\n",        // DC=/AC= with eq + acphase
-        "* t\nV1 a 0 PULSE(0 5 1n 1n 1n 5n 10n)\n", // tran source
-        "* t\n.dc V1 0 5 1 V2 0 3 1\n",      // two dc commands
-        "* t\n.meas tran m WHEN v(a)=1\n",   // measure WHEN
+        "* t\n.param x = [1 2 3]\n",                  // array literal
+        "* t\n.param x = a ? b : c\n",                // full ternary
+        "* t\nV1 a 0 DC=5 AC=1 90\n",                 // DC=/AC= with eq + acphase
+        "* t\nV1 a 0 PULSE(0 5 1n 1n 1n 5n 10n)\n",   // tran source
+        "* t\n.dc V1 0 5 1 V2 0 3 1\n",               // two dc commands
+        "* t\n.meas tran m WHEN v(a)=1\n",            // measure WHEN
         "* t\n.meas tran m FIND v(a) AT=1n RISE=2\n", // find + at + rise
         "* t\n.meas tran m TRIG v(a) VAL=1 TD=1n TARG v(b) VAL=2\n",
         "* t\nE1 out 0 POLY(2) a 0 b 0 1 2 3\n",
         "* t\nG1 out 0 TABLE {v(a)} (0,0) (1,1)\n",
         "* t\nX1 a b sub p1=1 p2=2\n",
-        "* t\nX1 a b p1=1 subname\n",        // model_after
+        "* t\nX1 a b p1=1 subname\n", // model_after
         // --- token-layer + trivia edge cases ---
         "* t\nR1 a b 1k\n\n* comment\nR2 a b 2k\n", // blank + comment between stmts
-        "* t\nR1 a b\\\n1k\n",                 // backslash line continuation
+        "* t\nR1 a b\\\n1k\n",                      // backslash line continuation
         // --- sub-branches that need specific shapes ---
         ".subckt s a b p1=1\nR1 a b 1k\n.ends\n", // subckt with parameters
-        "* t\n.model rm r r=1k dev/gauss=0.1\n",   // DevMod with slash/distr
-        "* t\n.model rm r r=1k dev=0.1\n",         // DevMod without slash
-        "* t\n.param y = f(a, b, c)\n",            // multi-arg function call
-        "* t\nV1 vcc 0 DC +",                      // error extending to EOF
+        "* t\n.model rm r r=1k dev/gauss=0.1\n",  // DevMod with slash/distr
+        "* t\n.model rm r r=1k dev=0.1\n",        // DevMod without slash
+        "* t\n.param y = f(a, b, c)\n",           // multi-arg function call
+        "* t\nV1 vcc 0 DC +",                     // error extending to EOF
         "* t\nG1 out 0 TABLE {v(a)}=(0,0)(1,1)\n", // TABLE with '='
-        "* t\nQ1 c b e s m\n",                     // BJT with substrate node
-        "* t\nQ1 c b e s t m\n",                   // BJT with substrate + thermal
+        "* t\nQ1 c b e s m\n",                    // BJT with substrate node
+        "* t\nQ1 c b e s t m\n",                  // BJT with substrate + thermal
     ];
     for src in inputs {
         ok(src);
@@ -113,15 +113,43 @@ fn malformed_and_edge_inputs_are_lossless() {
 #[test]
 fn expression_operators_parse_losslessly() {
     let exprs = &[
-        "a+b", "a-b", "a*b", "a/b", "a%b", "a**b",
-        "a<b", "a>b", "a<=b", "a>=b", "a==b", "a!=b", "a===b",
-        "a<<b", "a>>b", "a<<<b",
-        "a&b", "a|b", "a^b", "a^~b", "a~^b",
-        "a&&b", "a||b",
+        "a+b",
+        "a-b",
+        "a*b",
+        "a/b",
+        "a%b",
+        "a**b",
+        "a<b",
+        "a>b",
+        "a<=b",
+        "a>=b",
+        "a==b",
+        "a!=b",
+        "a===b",
+        "a<<b",
+        "a>>b",
+        "a<<<b",
+        "a&b",
+        "a|b",
+        "a^b",
+        "a^~b",
+        "a~^b",
+        "a&&b",
+        "a||b",
         // mixed precedence → recursion + opterm branches
-        "a+b*c", "a*b+c", "a+b+c", "a-b-c", "a*b/c", "a**b**c",
-        "a+b*c-d/e", "a<b+c", "a&&b||c", "a==b&&c",
-        "-a+b", "+a-b", "a+-b",
+        "a+b*c",
+        "a*b+c",
+        "a+b+c",
+        "a-b-c",
+        "a*b/c",
+        "a**b**c",
+        "a+b*c-d/e",
+        "a<b+c",
+        "a&&b||c",
+        "a==b&&c",
+        "-a+b",
+        "+a-b",
+        "a+-b",
     ];
     for e in exprs {
         ok(&format!("* t\n.param x = {{{e}}}\n"));
@@ -137,14 +165,14 @@ fn expression_operators_parse_losslessly() {
 #[test]
 fn spectre_formerly_crashing_inputs_are_lossless() {
     let cases = [
-        "ic node value\n",              // ic parameter missing '='
-        "nodeset x=\n",                 // parameter value missing
-        "save foo:\n",                  // dangling save-signal ':'
-        "ahdl_include device.va\n",     // ahdl_include filename not a string
-        "include\n",                    // include with no filename
-        "myalt alter param=\n",         // control statement, missing value
-        "tr1 tran stop=\n",             // analysis, missing value
-        "parameters n=a~|b~|c\n",       // '~|' reduction-or, now a real operator
+        "ic node value\n",          // ic parameter missing '='
+        "nodeset x=\n",             // parameter value missing
+        "save foo:\n",              // dangling save-signal ':'
+        "ahdl_include device.va\n", // ahdl_include filename not a string
+        "include\n",                // include with no filename
+        "myalt alter param=\n",     // control statement, missing value
+        "tr1 tran stop=\n",         // analysis, missing value
+        "parameters n=a~|b~|c\n",   // '~|' reduction-or, now a real operator
     ];
     for src in cases {
         let tree = netlist_syntax::parse_spectre(src);

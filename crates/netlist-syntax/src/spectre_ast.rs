@@ -37,9 +37,10 @@ fn nth_token(parent: &SyntaxNode, kind: SyntaxKind, n: usize) -> Option<SyntaxTo
 /// token — the RHS of a `name = value` construct. Handles Spectre's bare-token
 /// expression leaves as well as wrapper expression nodes.
 fn value_text_after_eq(parent: &SyntaxNode) -> Option<String> {
-    element_text_after(parent, |el| {
-        matches!(el, NodeOrToken::Token(t) if t.kind() == SyntaxKind::Notation && t.text() == "=")
-    })
+    element_text_after(
+        parent,
+        |el| matches!(el, NodeOrToken::Token(t) if t.kind() == SyntaxKind::Notation && t.text() == "="),
+    )
 }
 
 /// Source text of the first non-trivia element appearing after the first
@@ -260,9 +261,10 @@ ast_node!(SaveSignalModifier);
 impl SaveSignalModifier {
     /// The modifier token after the `:` (a save keyword, number, or identifier).
     pub fn value(&self) -> Option<String> {
-        element_text_after(&self.0, |el| {
-            matches!(el, NodeOrToken::Token(t) if t.kind() == SyntaxKind::Notation && t.text() == ":")
-        })
+        element_text_after(
+            &self.0,
+            |el| matches!(el, NodeOrToken::Token(t) if t.kind() == SyntaxKind::Notation && t.text() == ":"),
+        )
     }
 }
 
@@ -346,9 +348,10 @@ impl FunctionDecl {
     }
     /// The returned expression as source text.
     pub fn return_expr(&self) -> Option<String> {
-        element_text_after(&self.0, |el| {
-            matches!(el, NodeOrToken::Token(t) if t.kind() == SyntaxKind::Keyword && t.text() == "return")
-        })
+        element_text_after(
+            &self.0,
+            |el| matches!(el, NodeOrToken::Token(t) if t.kind() == SyntaxKind::Keyword && t.text() == "return"),
+        )
     }
 }
 
@@ -377,9 +380,10 @@ impl ConditionalBlock {
 /// The condition expression text between `(` and `)`, plus the instantiated
 /// body instance, shared by `if`/`else if` clauses.
 fn condition_text(parent: &SyntaxNode) -> Option<String> {
-    element_text_after(parent, |el| {
-        matches!(el, NodeOrToken::Token(t) if t.kind() == SyntaxKind::Notation && t.text() == "(")
-    })
+    element_text_after(
+        parent,
+        |el| matches!(el, NodeOrToken::Token(t) if t.kind() == SyntaxKind::Notation && t.text() == "("),
+    )
 }
 
 ast_node!(If);
@@ -509,9 +513,7 @@ mod tests {
 
     #[test]
     fn subckt_ports_and_body() {
-        let s: Subckt = first(
-            "subckt inv (in out vdd vss)\n  m1 (out in vss vss) nch\nends inv\n",
-        );
+        let s: Subckt = first("subckt inv (in out vdd vss)\n  m1 (out in vss vss) nch\nends inv\n");
         assert_eq!(tok(s.name()), "inv");
         assert!(!s.is_inline());
         let ports: Vec<String> = s.ports().iter().map(|n| n.path()).collect();
@@ -564,7 +566,10 @@ mod tests {
         let inc: Include = first("include \"models.scs\" section=tt\n");
         assert_eq!(tok(inc.path()), "\"models.scs\"");
         assert_eq!(
-            inc.section().and_then(|s| s.id()).map(|t| t.text().to_string()).as_deref(),
+            inc.section()
+                .and_then(|s| s.id())
+                .map(|t| t.text().to_string())
+                .as_deref(),
             Some("tt")
         );
     }
@@ -588,12 +593,18 @@ mod tests {
         let iff = cond.if_clause().expect("if clause");
         assert_eq!(iff.condition().as_deref(), Some("l < 0.5u"));
         assert_eq!(
-            iff.body_instance().and_then(|i| i.name()).map(|t| t.text().to_string()).as_deref(),
+            iff.body_instance()
+                .and_then(|i| i.name())
+                .map(|t| t.text().to_string())
+                .as_deref(),
             Some("m1")
         );
         let els = cond.else_clause().expect("else clause");
         assert_eq!(
-            els.body_instance().and_then(|i| i.master()).map(|t| t.text().to_string()).as_deref(),
+            els.body_instance()
+                .and_then(|i| i.master())
+                .map(|t| t.text().to_string())
+                .as_deref(),
             Some("longmod")
         );
     }

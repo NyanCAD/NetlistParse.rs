@@ -98,7 +98,11 @@ struct TrieNode {
 
 impl TrieNode {
     fn new() -> Self {
-        TrieNode { value: None, is_key: false, children: BTreeMap::new() }
+        TrieNode {
+            value: None,
+            is_key: false,
+            children: BTreeMap::new(),
+        }
     }
 }
 
@@ -108,7 +112,9 @@ pub struct KeywordTrie {
 
 impl KeywordTrie {
     pub fn new() -> Self {
-        let mut trie = KeywordTrie { nodes: vec![TrieNode::new()] };
+        let mut trie = KeywordTrie {
+            nodes: vec![TrieNode::new()],
+        };
         for &(name, kind) in KEYWORDS {
             trie.insert(name, kind);
         }

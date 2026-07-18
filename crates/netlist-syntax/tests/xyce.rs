@@ -71,7 +71,8 @@ fn xyce_y_device_is_osdi() {
     // call (name, nodes, model) rather than erroring.
     let tree = parse_spice_dialect("* t\nYGENEXT g1 a b osdimod\n", Dialect::Xyce);
     assert!(
-        tree.descendants().any(|n| n.kind() == SyntaxKind::OSDIDevice),
+        tree.descendants()
+            .any(|n| n.kind() == SyntaxKind::OSDIDevice),
         "expected an OSDIDevice node for the Y device"
     );
 }

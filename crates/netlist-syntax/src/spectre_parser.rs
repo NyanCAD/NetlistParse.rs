@@ -98,8 +98,14 @@ impl<'a> Parser<'a> {
             raw,
             p: 0,
             started: false,
-            nt: Sig { idx: 0, kind: ERROR },
-            nnt: Sig { idx: 0, kind: ERROR },
+            nt: Sig {
+                idx: 0,
+                kind: ERROR,
+            },
+            nnt: Sig {
+                idx: 0,
+                kind: ERROR,
+            },
             emit_idx: 0,
             builder: GreenNodeBuilder::new(),
             errored: false,
@@ -143,8 +149,13 @@ impl<'a> Parser<'a> {
     /// until the dialect switches back, then resync the Spectre cursor.
     fn handoff_to_spice(&mut self, start_byte: u32) {
         let builder = std::mem::replace(&mut self.builder, GreenNodeBuilder::new());
-        let (builder, stop, errored) =
-            crate::parser::parse_spice_region(self.src, Dialect::Ngspice, builder, start_byte, true);
+        let (builder, stop, errored) = crate::parser::parse_spice_region(
+            self.src,
+            Dialect::Ngspice,
+            builder,
+            start_byte,
+            true,
+        );
         self.builder = builder;
         self.errored |= errored;
         self.resync_at(stop);
@@ -203,7 +214,10 @@ impl<'a> Parser<'a> {
 
     fn next_sig(&mut self) -> Sig {
         let idx = self.get_next_action();
-        Sig { idx, kind: self.raw[idx].kind }
+        Sig {
+            idx,
+            kind: self.raw[idx].kind,
+        }
     }
 
     fn advance(&mut self) {
@@ -291,7 +305,11 @@ impl<'a> Parser<'a> {
     ) -> PResult {
         let r = body(self);
         if !self.dry {
-            let kind = if r.is_ok() { ok_kind } else { SyntaxKind::Incomplete };
+            let kind = if r.is_ok() {
+                ok_kind
+            } else {
+                SyntaxKind::Incomplete
+            };
             self.builder.start_node_at(cp, to_raw(kind));
             self.builder.finish_node();
         }
@@ -309,7 +327,8 @@ impl<'a> Parser<'a> {
     ) -> PResult {
         let r = body(self);
         if r.is_err() && !self.dry {
-            self.builder.start_node_at(cp, to_raw(SyntaxKind::Incomplete));
+            self.builder
+                .start_node_at(cp, to_raw(SyntaxKind::Incomplete));
             self.builder.finish_node();
         }
         r
@@ -704,7 +723,9 @@ impl<'a> Parser<'a> {
         let saved = self.save_state();
         self.dry = true;
         let _ = self.take_identifier();
-        let r = self.parse_parameter_list().and_then(|_| self.accept_newline());
+        let r = self
+            .parse_parameter_list()
+            .and_then(|_| self.accept_newline());
         self.restore_state(saved);
         r.is_ok()
     }
@@ -740,8 +761,10 @@ impl<'a> Parser<'a> {
         self.flush_trivia(self.nt.idx); // leading trivia before the phantom
         let t = self.raw[self.nt.idx];
         if t.end > t.start && !self.dry {
-            self.builder
-                .token(to_raw(SyntaxKind::Identifier), &self.src[t.start as usize..t.end as usize]);
+            self.builder.token(
+                to_raw(SyntaxKind::Identifier),
+                &self.src[t.start as usize..t.end as usize],
+            );
         }
         // Deliberately do NOT advance the cursor or `emit_idx`: the *real*
         // `take_identifier` re-emits the same token next.
@@ -1033,7 +1056,11 @@ impl<'a> Parser<'a> {
             return Err(());
         }
         let tail = self.parse_conditional_body();
-        let kind = if tail.is_ok() { form } else { SyntaxKind::Incomplete };
+        let kind = if tail.is_ok() {
+            form
+        } else {
+            SyntaxKind::Incomplete
+        };
         self.wrap_at(cp, kind);
         tail
     }
@@ -1065,7 +1092,9 @@ impl<'a> Parser<'a> {
         self.dry = true;
         let _ = self.take_identifier();
         let icp = self.checkpoint();
-        let r = self.parse_instance(icp).and_then(|_| self.accept(&[RBRACE]));
+        let r = self
+            .parse_instance(icp)
+            .and_then(|_| self.accept(&[RBRACE]));
         self.restore_state(saved);
         r.is_ok()
     }

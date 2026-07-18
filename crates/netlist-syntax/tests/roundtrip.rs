@@ -58,7 +58,11 @@ fn roundtrip_all_spectre_corpus() {
     let mut files = Vec::new();
     collect_spectre(&dir, &mut files);
     files.sort();
-    assert!(!files.is_empty(), "no spectre corpus files found in {}", dir.display());
+    assert!(
+        !files.is_empty(),
+        "no spectre corpus files found in {}",
+        dir.display()
+    );
     for path in &files {
         // The one documented exception to text==source: on an if/elseif/else
         // *body* failure the Julia parser double-captures the block name and

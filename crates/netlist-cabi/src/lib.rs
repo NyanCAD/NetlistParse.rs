@@ -38,7 +38,11 @@ fn dialect_from(d: u32) -> Dialect {
 /// # Safety
 /// `src` must point to at least `len` readable bytes.
 #[no_mangle]
-pub unsafe extern "C" fn nl_parse_spice(src: *const c_char, len: usize, dialect: u32) -> *mut NlTree {
+pub unsafe extern "C" fn nl_parse_spice(
+    src: *const c_char,
+    len: usize,
+    dialect: u32,
+) -> *mut NlTree {
     if src.is_null() {
         return std::ptr::null_mut();
     }
@@ -57,7 +61,11 @@ pub unsafe extern "C" fn nl_parse_spice(src: *const c_char, len: usize, dialect:
             }
         }
     }
-    Box::into_raw(Box::new(NlTree { root, errors, _src: s }))
+    Box::into_raw(Box::new(NlTree {
+        root,
+        errors,
+        _src: s,
+    }))
 }
 
 /// Free a tree. Safe to call with null.
@@ -187,7 +195,8 @@ pub unsafe extern "C" fn nl_tree_error(
     start: *mut u32,
     end: *mut u32,
 ) -> bool {
-    match (&(*tree).errors).get(i) {
+    let tree = &*tree;
+    match tree.errors.get(i) {
         Some(&[s, e]) => {
             *start = s;
             *end = e;

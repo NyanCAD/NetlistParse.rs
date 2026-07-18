@@ -434,7 +434,10 @@ impl Subckt {
     /// Body statements between the header and `.ends`.
     pub fn body(&self) -> impl Iterator<Item = SyntaxNode> + '_ {
         self.0.children().filter(|n| {
-            !matches!(n.kind(), SyntaxKind::HierarchialNode | SyntaxKind::Parameter)
+            !matches!(
+                n.kind(),
+                SyntaxKind::HierarchialNode | SyntaxKind::Parameter
+            )
         })
     }
 }
@@ -903,7 +906,9 @@ impl LibStatement {
     }
     /// Statements inside the `.lib`/`.endl` block.
     pub fn statements(&self) -> impl Iterator<Item = SyntaxNode> + '_ {
-        self.0.children().filter(|n| n.kind() != SyntaxKind::EndlStatement)
+        self.0
+            .children()
+            .filter(|n| n.kind() != SyntaxKind::EndlStatement)
     }
     pub fn end(&self) -> Option<EndlStatement> {
         support::child(&self.0)
@@ -998,7 +1003,9 @@ impl IfElseCase {
     }
     /// Body statements in this branch.
     pub fn body(&self) -> impl Iterator<Item = SyntaxNode> + '_ {
-        self.0.children().filter(|n| n.kind() != SyntaxKind::Condition)
+        self.0
+            .children()
+            .filter(|n| n.kind() != SyntaxKind::Condition)
     }
 }
 
@@ -1149,10 +1156,7 @@ mod tests {
     #[test]
     fn resistor_fields() {
         let r = root("* t\nR1 in out 1k\n");
-        let res = r
-            .statements()
-            .find_map(Resistor::cast)
-            .expect("a Resistor");
+        let res = r.statements().find_map(Resistor::cast).expect("a Resistor");
         assert_eq!(res.name().unwrap().text(), "R1");
         assert_eq!(res.pos().unwrap().text(), "in");
         assert_eq!(res.neg().unwrap().text(), "out");
@@ -1163,7 +1167,10 @@ mod tests {
     fn resistor_with_param_value() {
         let r = root("* t\nR1 a b r=1k\n");
         let res = r.statements().find_map(Resistor::cast).unwrap();
-        assert!(res.value().is_none(), "value is a parameter, not positional");
+        assert!(
+            res.value().is_none(),
+            "value is a parameter, not positional"
+        );
         let p = res.params().next().unwrap();
         assert_eq!(p.name().unwrap().text(), "r");
         assert_eq!(p.value().unwrap().text(), "1k");
@@ -1235,7 +1242,10 @@ mod tests {
         let srcs: Vec<_> = v.sources().collect();
         assert!(srcs.iter().any(|n| n.kind() == SyntaxKind::DCSource));
         let tran = TranSource::cast(
-            srcs.iter().find(|n| n.kind() == SyntaxKind::TranSource).unwrap().clone(),
+            srcs.iter()
+                .find(|n| n.kind() == SyntaxKind::TranSource)
+                .unwrap()
+                .clone(),
         )
         .unwrap();
         assert_eq!(tran.function().unwrap().text(), "SIN");
@@ -1253,7 +1263,10 @@ mod tests {
         assert_eq!(case.keyword().unwrap().text(), "if");
         assert!(case.condition().is_some());
         assert!(case.body().any(|n| n.kind() == SyntaxKind::Resistor));
-        let m = r.statements().find_map(MeasurePointStatement::cast).unwrap();
+        let m = r
+            .statements()
+            .find_map(MeasurePointStatement::cast)
+            .unwrap();
         assert_eq!(m.analysis().unwrap().text(), "tran");
         assert!(m.find_deriv_param().is_some());
     }
