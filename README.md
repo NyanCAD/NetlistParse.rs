@@ -102,6 +102,16 @@ are emitted as `rowan` tokens so the tree tiles the source, but carry trivia
 `SyntaxKind`s and are omitted from the canonical dump — matching Julia, where
 trivia is absorbed into node offsets and never becomes a node.
 
+### Test corpus
+
+The `tests/corpus/` directory contains SPICE and Spectre netlists drawn from
+simulator manuals and real-world examples. Coverage netlists (`cov_*.sp`) are
+validated against **ngspice** (`tools/validate_ngspice.sh` — runs them through
+`ngspice -b` and checks for syntax/fatal errors), and Xyce-dialect netlists
+(`tests/xyce/`) are validated against **Xyce** (`tools/validate_xyce.sh` — runs
+them through `Xyce -syntax`). This grounds the parser in real simulator behavior:
+the Rust parser must accept exactly the inputs the simulators accept.
+
 ### Differential testing
 
 The validation gate: the Rust CST dump must byte-match the Julia parser's dump.
@@ -111,6 +121,13 @@ holds dumps captured from the Julia parser, and `cargo test` checks the Rust
 output against them — **no Julia needed at test time**. To refresh ground truth
 after a Julia-side change, run `tests/regen_expected.sh` against a Julia checkout
 of Cadnip (see the script header).
+
+### Robustness testing
+
+Every malformed or edge-case input must parse without panicking and reconstruct
+its source exactly (the lossless-tree guarantee). These tests don't compare
+against Julia — deep error-recovery nesting can differ — but verify that error
+recovery never loses bytes.
 
 Coverage (via [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov)) is
 ~90% regions / ~94% lines of `netlist-syntax`. The remainder is intentionally
