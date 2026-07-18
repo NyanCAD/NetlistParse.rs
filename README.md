@@ -1,5 +1,9 @@
 # NetlistParse.rs
 
+[![CI](https://github.com/NyanCAD/NetlistParse.rs/actions/workflows/ci.yml/badge.svg)](https://github.com/NyanCAD/NetlistParse.rs/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/github/NyanCAD/NetlistParse.rs/branch/main/graph/badge.svg?token=AO9I3J3PM2)](https://codecov.io/github/NyanCAD/NetlistParse.rs)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A fast, standalone Rust parser for **SPICE** and **Spectre** circuit netlists. It
 produces a lossless concrete syntax tree (CST) and exposes it to C, C++, and
 Python — so tools can parse netlists without a Julia (or any simulator) runtime.
