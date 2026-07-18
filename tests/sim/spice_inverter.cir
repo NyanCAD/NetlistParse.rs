@@ -1,0 +1,9 @@
+* CMOS Inverter - SPICE netlist for VACASK via Rust parser
+Vdd vdd 0 DC 3.3
+Vin in 0 PULSE(0 3.3 1m 1u 1u 4m 10m)
+M1 out in 0 0 nch w=10u l=0.35u
+M2 out in vdd vdd pch w=20u l=0.35u
+.model nch nmos level=3
+.model pch pmos level=3
+.tran 1u 10m
+.end
