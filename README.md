@@ -11,7 +11,9 @@ Python — so tools can parse netlists without a Julia (or any simulator) runtim
 It is a port of the netlist parser in
 [Cadnip.jl](https://github.com/NyanCAD/Cadnip.jl) (`NyanLexers.jl` +
 `NyanSpectreNetlistParser.jl`), validated to reproduce that parser's tree
-**byte-for-byte** by a differential test suite.
+**byte-for-byte** by a differential test suite. The test corpus is drawn from
+simulator manuals and validated against **ngspice** and **Xyce** to ensure the
+parser accepts exactly the inputs real simulators accept.
 
 ## Highlights
 
