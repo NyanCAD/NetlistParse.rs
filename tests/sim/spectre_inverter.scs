@@ -1,0 +1,13 @@
+// CMOS Inverter - Spectre netlist for VACASK via Rust parser
+
+model vsource vsource
+model nch bsim3 type=1
+model pch bsim3 type=-1
+
+M1 (out in 0 0) nch w=10u l=0.35u
+M2 (out in vdd vdd) pch w=20u l=0.35u
+
+Vdd (vdd 0) vsource dc=3.3
+Vin (in 0) vsource type="pulse" val0=0 val1=3.3 delay=1m rise=1u fall=1u width=4m period=10m
+
+tran1 tran stop=10m step=1u

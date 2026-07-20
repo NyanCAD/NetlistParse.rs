@@ -199,6 +199,11 @@ mod ffi {
         fn parse_netlist(src: &str, start_spice: bool) -> Netlist;
         /// Back-compat: parse starting in the Spectre dialect.
         fn parse_spectre_netlist(src: &str) -> Netlist;
+        /// Parse a SPICE `.lib` file and project only the content from the
+        /// named section (`.lib <section>` … `.endl <section>`). Top-level
+        /// content outside any section is included unconditionally (parameters,
+        /// includes, etc. that precede the first `.lib` block).
+        fn parse_netlist_lib(src: &str, section: &str) -> Netlist;
     }
 }
 
@@ -722,8 +727,9 @@ fn project_spice_subckt(s: &ast::Subckt) -> ffi::SpiceSubckt {
     }
 }
 
-/// Project a `SPICENetlistSource` node into a `SpiceBlock`.
-fn project_spice_block(node: SyntaxNode) -> ffi::SpiceBlock {
+/// Project an iterator of SPICE children (params, models, subckts, devices,
+/// includes) into a `SpiceBlock`.
+fn project_spice_block_children(children: impl Iterator<Item = SyntaxNode>) -> ffi::SpiceBlock {
     let mut block = ffi::SpiceBlock {
         params: vec![],
         models: vec![],
@@ -731,8 +737,15 @@ fn project_spice_block(node: SyntaxNode) -> ffi::SpiceBlock {
         devices: vec![],
         includes: vec![],
     };
-    for child in node.children() {
+    for child in children {
         match child.kind() {
+            SyntaxKind::ParamStatement => {
+                if let Some(ps) = ast::ParamStatement::cast(child) {
+                    for p in ps.params() {
+                        block.params.push(project_spice_param(&p));
+                    }
+                }
+            }
             SyntaxKind::Model => {
                 if let Some(m) = ast::Model::cast(child) {
                     block.models.push(project_spice_model(&m));
@@ -743,7 +756,6 @@ fn project_spice_block(node: SyntaxNode) -> ffi::SpiceBlock {
                     block.subckts.push(project_spice_subckt(&s));
                 }
             }
-            // .include "path" → Include { path, section: "" }
             SyntaxKind::IncludeStatement => {
                 if let Some(inc) = ast::IncludeStatement::cast(child) {
                     block.includes.push(ffi::Include {
@@ -752,7 +764,6 @@ fn project_spice_block(node: SyntaxNode) -> ffi::SpiceBlock {
                     });
                 }
             }
-            // .lib "path" section  → Include { path, section }
             SyntaxKind::LibInclude => {
                 if let Some(lib) = ast::LibInclude::cast(child) {
                     block.includes.push(ffi::Include {
@@ -769,6 +780,11 @@ fn project_spice_block(node: SyntaxNode) -> ffi::SpiceBlock {
         }
     }
     block
+}
+
+/// Project a `SPICENetlistSource` node into a `SpiceBlock`.
+fn project_spice_block(node: SyntaxNode) -> ffi::SpiceBlock {
+    project_spice_block_children(node.children())
 }
 
 /// The definition-level content shared by a netlist and a subckt body.
@@ -913,9 +929,56 @@ pub fn parse_spectre_netlist(src: &str) -> ffi::Netlist {
     parse_netlist(src, false)
 }
 
+/// Parse a SPICE `.lib` file and project only the matching section.
+pub fn parse_netlist_lib(src: &str, section: &str) -> ffi::Netlist {
+    use netlist_syntax::parse_spice;
+
+    let root = parse_spice(src);
+    let errors = collect_errors(&root);
+
+    let mut block = ffi::SpiceBlock {
+        params: vec![],
+        models: vec![],
+        subckts: vec![],
+        devices: vec![],
+        includes: vec![],
+    };
+
+    for child in root.children() {
+        if child.kind() == SyntaxKind::LibStatement {
+            if let Some(lib) = ast::LibStatement::cast(child) {
+                let name = tok_text(lib.name());
+                if name.eq_ignore_ascii_case(section) {
+                    let inner = project_spice_block_children(lib.statements());
+                    block.params.extend(inner.params);
+                    block.models.extend(inner.models);
+                    block.subckts.extend(inner.subckts);
+                    block.devices.extend(inner.devices);
+                    block.includes.extend(inner.includes);
+                }
+            }
+        }
+    }
+
+    ffi::Netlist {
+        params: vec![],
+        models: vec![],
+        subckts: vec![],
+        instances: vec![],
+        analyses: vec![],
+        saves: vec![],
+        ics: vec![],
+        globals: vec![],
+        includes: vec![],
+        ahdl_includes: vec![],
+        errors,
+        spice_blocks: vec![block],
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_netlist, parse_spectre_netlist};
+    use super::{parse_netlist, parse_netlist_lib, parse_spectre_netlist};
 
     #[test]
     fn projects_top_level() {
@@ -1164,6 +1227,51 @@ mod tests {
         assert_eq!(b.includes[0].path, "models.spice");
         assert_eq!(b.includes[1].path, "mylib.sp");
         assert_eq!(b.includes[1].section, "tt");
+    }
+
+    #[test]
+    fn parse_lib_extracts_section() {
+        let src = "* SKY130 models\n\
+.lib tt\n\
+.param vth0_nfet = 0.4\n\
+.model nfet nmos level=54 version=4.5 tnom=27\n\
++ vth0=0.3\n\
+.endl tt\n\
+.lib ff\n\
+.param vth0_nfet = 0.35\n\
+.model nfet_ff nmos level=54\n\
+.endl ff\n";
+        let nl = parse_netlist_lib(src, "tt");
+        assert!(
+            nl.errors.is_empty(),
+            "parse errors: {} error(s)",
+            nl.errors.len()
+        );
+        assert_eq!(nl.spice_blocks.len(), 1);
+        let b = &nl.spice_blocks[0];
+        assert_eq!(b.params.len(), 1);
+        assert_eq!(b.params[0].name, "vth0_nfet");
+        assert_eq!(b.params[0].value, "0.4");
+        assert_eq!(b.models.len(), 1);
+        assert_eq!(b.models[0].name, "nfet");
+
+        let nl_ff = parse_netlist_lib(src, "ff");
+        let b_ff = &nl_ff.spice_blocks[0];
+        assert_eq!(b_ff.params.len(), 1);
+        assert_eq!(b_ff.params[0].value, "0.35");
+        assert_eq!(b_ff.models[0].name, "nfet_ff");
+
+        let nl_miss = parse_netlist_lib(src, "ss");
+        let b_miss = &nl_miss.spice_blocks[0];
+        assert!(b_miss.params.is_empty());
+        assert!(b_miss.models.is_empty());
+    }
+
+    #[test]
+    fn parse_lib_case_insensitive() {
+        let src = "* t\n.lib TT\n.param x=1\n.endl TT\n";
+        let nl = parse_netlist_lib(src, "tt");
+        assert_eq!(nl.spice_blocks[0].params.len(), 1);
     }
 
     #[test]
