@@ -945,21 +945,18 @@ pub fn parse_netlist_lib(src: &str, section: &str) -> ffi::Netlist {
     };
 
     for child in root.children() {
-        match child.kind() {
-            SyntaxKind::LibStatement => {
-                if let Some(lib) = ast::LibStatement::cast(child) {
-                    let name = tok_text(lib.name());
-                    if name.eq_ignore_ascii_case(section) {
-                        let inner = project_spice_block_children(lib.statements());
-                        block.params.extend(inner.params);
-                        block.models.extend(inner.models);
-                        block.subckts.extend(inner.subckts);
-                        block.devices.extend(inner.devices);
-                        block.includes.extend(inner.includes);
-                    }
+        if child.kind() == SyntaxKind::LibStatement {
+            if let Some(lib) = ast::LibStatement::cast(child) {
+                let name = tok_text(lib.name());
+                if name.eq_ignore_ascii_case(section) {
+                    let inner = project_spice_block_children(lib.statements());
+                    block.params.extend(inner.params);
+                    block.models.extend(inner.models);
+                    block.subckts.extend(inner.subckts);
+                    block.devices.extend(inner.devices);
+                    block.includes.extend(inner.includes);
                 }
             }
-            _ => {}
         }
     }
 
@@ -1245,7 +1242,11 @@ mod tests {
 .model nfet_ff nmos level=54\n\
 .endl ff\n";
         let nl = parse_netlist_lib(src, "tt");
-        assert!(nl.errors.is_empty(), "parse errors: {} error(s)", nl.errors.len());
+        assert!(
+            nl.errors.is_empty(),
+            "parse errors: {} error(s)",
+            nl.errors.len()
+        );
         assert_eq!(nl.spice_blocks.len(), 1);
         let b = &nl.spice_blocks[0];
         assert_eq!(b.params.len(), 1);

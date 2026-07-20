@@ -2,7 +2,7 @@
 //! netlists. The PDK file tests are skipped when the sibling checkout
 //! `skywater-pdk-libs-sky130_fd_pr` is not present.
 
-use netlist_syntax::{parse_spice, parse_spectre, SyntaxKind, SyntaxNode};
+use netlist_syntax::{parse_spectre, parse_spice, SyntaxKind, SyntaxNode};
 use rowan::NodeOrToken;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -110,9 +110,7 @@ fn sky130_combined_models_roundtrip() {
         "roundtrip failures:\n{}",
         failures.join("\n")
     );
-    eprintln!(
-        "sky130 combined_models: {total} files parsed, {total_errors} total error nodes"
-    );
+    eprintln!("sky130 combined_models: {total} files parsed, {total_errors} total error nodes");
 }
 
 #[test]
@@ -147,7 +145,10 @@ fn sky130_nfet_pfet_models_clean() {
             "lossless roundtrip failed for {rel}"
         );
         let errors = error_count(&tree);
-        eprintln!("{rel}: {errors} error nodes ({} lines)", src.lines().count());
+        eprintln!(
+            "{rel}: {errors} error nodes ({} lines)",
+            src.lines().count()
+        );
     }
 }
 
@@ -207,6 +208,9 @@ fn vacask_inverter_demos_roundtrip() {
             "lossless roundtrip failed for {rel}"
         );
         let errors = error_count(&tree);
-        eprintln!("{rel}: {errors} error nodes ({} lines)", src.lines().count());
+        eprintln!(
+            "{rel}: {errors} error nodes ({} lines)",
+            src.lines().count()
+        );
     }
 }
