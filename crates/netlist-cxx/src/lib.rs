@@ -698,6 +698,11 @@ fn project_spice_subckt(s: &ast::Subckt) -> ffi::SpiceSubckt {
     let mut devices = vec![];
     let mut models = vec![];
     let mut subckts = vec![];
+    // Formal params from the `.subckt` header (e.g. `w=1 l=1`). Internal
+    // `.param` statements from the body are appended below, after the formal
+    // params, so downstream sees them in source order (body params may depend
+    // on the formal ones).
+    let mut params: Vec<ffi::Param> = s.params().map(|p| project_spice_param(&p)).collect();
     for child in s.body() {
         match child.kind() {
             SyntaxKind::Model => {
@@ -710,6 +715,13 @@ fn project_spice_subckt(s: &ast::Subckt) -> ffi::SpiceSubckt {
                     subckts.push(project_spice_subckt(&sub));
                 }
             }
+            SyntaxKind::ParamStatement => {
+                if let Some(ps) = ast::ParamStatement::cast(child) {
+                    for p in ps.params() {
+                        params.push(project_spice_param(&p));
+                    }
+                }
+            }
             _ => {
                 if let Some(dev) = project_spice_device(child) {
                     devices.push(dev);
@@ -720,7 +732,7 @@ fn project_spice_subckt(s: &ast::Subckt) -> ffi::SpiceSubckt {
     ffi::SpiceSubckt {
         name: tok_text(s.name()),
         ports: s.ports().map(|p| p.text()).collect(),
-        params: s.params().map(|p| project_spice_param(&p)).collect(),
+        params,
         devices,
         models,
         subckts,
@@ -1055,6 +1067,35 @@ mod tests {
         assert_eq!(d[2].name, "L1");
         assert_eq!(d[2].nodes, vec!["a", "b"]);
         assert_eq!(d[2].value, "2n");
+    }
+
+    #[test]
+    fn projects_spice_subckt_body_params() {
+        // `.param` statements inside a SPICE `.subckt` body must be projected
+        // (they were previously dropped). They are appended *after* the formal
+        // header params, in source order, since body params may reference the
+        // formal ones.
+        let nl = super::parse_netlist(
+            "* t\n\
+             .subckt rcblock a b w=1u l=2u\n\
+             .param rint=3k\n\
+             .param cint=1p\n\
+             R1 a b rint\n\
+             .ends\n",
+            true,
+        );
+        assert!(nl.errors.is_empty(), "unexpected parse errors");
+        assert_eq!(nl.spice_blocks.len(), 1);
+        let subs = &nl.spice_blocks[0].subckts;
+        assert_eq!(subs.len(), 1);
+        let s = &subs[0];
+        assert_eq!(s.name, "rcblock");
+        assert_eq!(s.ports, vec!["a", "b"]);
+        // Formal header params (w, l) first, then body `.param`s (rint, cint).
+        let names: Vec<&str> = s.params.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["w", "l", "rint", "cint"]);
+        let vals: Vec<&str> = s.params.iter().map(|p| p.value.as_str()).collect();
+        assert_eq!(vals, vec!["1u", "2u", "3k", "1p"]);
     }
 
     #[test]
