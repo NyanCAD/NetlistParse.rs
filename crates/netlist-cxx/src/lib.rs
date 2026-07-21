@@ -698,6 +698,11 @@ fn project_spice_subckt(s: &ast::Subckt) -> ffi::SpiceSubckt {
     let mut devices = vec![];
     let mut models = vec![];
     let mut subckts = vec![];
+    // Formal params from the `.subckt` header (e.g. `w=1 l=1`). Internal
+    // `.param` statements from the body are appended below, after the formal
+    // params, so downstream sees them in source order (body params may depend
+    // on the formal ones).
+    let mut params: Vec<ffi::Param> = s.params().map(|p| project_spice_param(&p)).collect();
     for child in s.body() {
         match child.kind() {
             SyntaxKind::Model => {
@@ -710,6 +715,13 @@ fn project_spice_subckt(s: &ast::Subckt) -> ffi::SpiceSubckt {
                     subckts.push(project_spice_subckt(&sub));
                 }
             }
+            SyntaxKind::ParamStatement => {
+                if let Some(ps) = ast::ParamStatement::cast(child) {
+                    for p in ps.params() {
+                        params.push(project_spice_param(&p));
+                    }
+                }
+            }
             _ => {
                 if let Some(dev) = project_spice_device(child) {
                     devices.push(dev);
@@ -720,7 +732,7 @@ fn project_spice_subckt(s: &ast::Subckt) -> ffi::SpiceSubckt {
     ffi::SpiceSubckt {
         name: tok_text(s.name()),
         ports: s.ports().map(|p| p.text()).collect(),
-        params: s.params().map(|p| project_spice_param(&p)).collect(),
+        params,
         devices,
         models,
         subckts,
