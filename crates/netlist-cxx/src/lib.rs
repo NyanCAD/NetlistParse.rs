@@ -1070,6 +1070,35 @@ mod tests {
     }
 
     #[test]
+    fn projects_spice_subckt_body_params() {
+        // `.param` statements inside a SPICE `.subckt` body must be projected
+        // (they were previously dropped). They are appended *after* the formal
+        // header params, in source order, since body params may reference the
+        // formal ones.
+        let nl = super::parse_netlist(
+            "* t\n\
+             .subckt rcblock a b w=1u l=2u\n\
+             .param rint=3k\n\
+             .param cint=1p\n\
+             R1 a b rint\n\
+             .ends\n",
+            true,
+        );
+        assert!(nl.errors.is_empty(), "unexpected parse errors");
+        assert_eq!(nl.spice_blocks.len(), 1);
+        let subs = &nl.spice_blocks[0].subckts;
+        assert_eq!(subs.len(), 1);
+        let s = &subs[0];
+        assert_eq!(s.name, "rcblock");
+        assert_eq!(s.ports, vec!["a", "b"]);
+        // Formal header params (w, l) first, then body `.param`s (rint, cint).
+        let names: Vec<&str> = s.params.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["w", "l", "rint", "cint"]);
+        let vals: Vec<&str> = s.params.iter().map(|p| p.value.as_str()).collect();
+        assert_eq!(vals, vec!["1u", "2u", "3k", "1p"]);
+    }
+
+    #[test]
     fn projects_spice_sources() {
         let nl = super::parse_netlist(
             "* t\nV1 1 0 DC 5 AC 1 PULSE(0 5 1m 1u 1u 4m 10m)\nI1 0 2 DC 1m\n",
