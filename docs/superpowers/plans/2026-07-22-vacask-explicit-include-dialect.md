@@ -4,14 +4,14 @@
 
 **Goal:** Let a VACASK `include` directive state its foreign dialect explicitly (`include "f" lang=ngspice section=tt`) and stop inferring the parser/dialect from the file extension.
 
-**Architecture:** The VACASK lexer captures an optional `lang=<dialect>` on an include; presence of `lang=` routes the file through the Rust bridge with that explicit dialect, absence routes it to VACASK's native parser. The dialect threads: lexer → `PendingForeign` → grammar drain → `mergeForeignFile` → dialect-aware Rust FFI, and inherits through nested includes. All Rust changes stay in the `netlist-cxx` FFI crate; `netlist-syntax` is unchanged (it already exposes `Dialect` + `parse_spice_dialect`).
+**Architecture:** The VACASK lexer captures an optional `lang=<dialect>` on an include; presence of `lang=` routes the file through the Rust bridge with that explicit dialect, absence routes it to VACASK's native parser. The dialect threads: lexer → `PendingForeign` → grammar drain → `mergeForeignFile` → dialect-aware Rust FFI, and inherits through nested includes. On the Rust side, `netlist-syntax`'s mixed parser (`parse_spectre_with`) gains a `dialect` parameter — removing the hardcoded `Dialect::Ngspice` in `handoff_to_spice` — and the `netlist-cxx` FFI passes the caller's dialect straight through, preserving the current CST shape (`SpectreNetlistSource` + `collect_scope`) and mid-file `simulator lang=` switching.
 
 **Tech Stack:** Rust (`cxx` FFI, `netlist-cxx`/`netlist-syntax`), C++17, flex (`dfllexer.l`), bison (`dflparser.y`), CMake/CTest.
 
 ## Global Constraints
 
 - Scope is **plumbing only**: no runtime ngspice→VACASK parameter/device translation. Raw ngspice loads will still fail on untranslated params (e.g. `scalm`); that is expected and out of scope.
-- Accepted `lang=` values (case-insensitive): `ngspice`, `hspice`, `pspice`, `xyce`, `spectre`. Map `ngspice/hspice/pspice/xyce` → `netlist_syntax::Dialect::{Ngspice,Hspice,Pspice,Xyce}`; `spectre` → the Spectre parser path.
+- Accepted `lang=` values (case-insensitive): `ngspice`, `hspice`, `pspice`, `xyce`, `spectre`. Map `ngspice/hspice/pspice/xyce` → `netlist_syntax::Dialect::{Ngspice,Hspice,Pspice,Xyce}` (parsed via `parse_spectre_with(src, StartLang::Spice, dialect)`); `spectre` → `parse_spectre_with(src, StartLang::Spectre, _)`.
 - `lang=` precedes the optional `section=` in the directive.
 - `lang=spectre section=…` is a hard error (Spectre sectioning is unsupported by `parse_netlist_lib`).
 - Unknown `lang=` value is a clear parse-time error naming the value and include path.
@@ -21,21 +21,99 @@
 
 ---
 
-### Task 1: Dialect-aware Rust FFI
+### Task 1: Dialect-aware parsing (netlist-syntax) + dialect-string FFI (netlist-cxx)
 
-Replace the `start_spice: bool` FFI with an explicit dialect string, and add the dialect to `parse_netlist_lib`. Keep the projection identical to today's proven paths.
+Thread a `dialect` through the mixed parser (kill the hardcoded `Dialect::Ngspice`), then replace the FFI's `start_spice: bool` with an explicit dialect string and add the dialect to `parse_netlist_lib`. The FFI keeps using the mixed parser + `collect_scope`, so projection is byte-identical to today except the SPICE dialect is now selectable.
 
 **Files:**
-- Modify: `crates/netlist-cxx/src/lib.rs` (extern block `~199-207`; `parse_netlist` `913-937`; `parse_spectre_netlist` `939-942` remove; `parse_netlist_lib` `944-989`; `#[cfg(test)]` module `~993-end`)
+- Modify: `crates/netlist-syntax/src/spectre_parser.rs` (`Parser` struct `~60-87`; `Parser::new` `94-117`; `handoff_to_spice` `150-162`; `parse` `1278-1280`; `parse_with` `1285-1290`)
+- Modify: `crates/netlist-syntax/src/lib.rs` (`parse_spectre_with` `45-47`)
+- Modify (callers of `parse_spectre_with`): `crates/netlist-syntax/tests/spectre_differential.rs:72`, `crates/netlist-syntax/tests/roundtrip.rs:85`, `crates/netlist-syntax/examples/dump_spectre.rs:19`
+- Modify: `crates/netlist-cxx/src/lib.rs` (`use` `19`; extern block `~199-207`; `parse_netlist` `913-937`; `parse_spectre_netlist` `939-942` remove; `parse_netlist_lib` `944-989`; `#[cfg(test)]` module `~993-end`)
 
 **Interfaces:**
+- Produces (netlist-syntax public API):
+  - `pub fn parse_spectre_with(src: &str, start_lang: StartLang, dialect: Dialect) -> SyntaxNode`
+    (the SPICE dialect used for any SPICE region — leading `.cir` region or mid-file `simulator lang=spice`).
 - Produces (FFI, called from C++ Task 2):
   - `fn parse_netlist(src: &str, language: &str) -> Netlist`
   - `fn parse_netlist_lib(src: &str, section: &str, language: &str) -> Netlist`
   - `parse_spectre_netlist` is removed (no C++ callers; `lang=spectre` covers it).
 - Internal helper: `resolve_lang(name: &str) -> Option<Lang>` where `enum Lang { Spice(Dialect), Spectre }`.
 
-- [ ] **Step 1: Write failing tests for the new signatures**
+- [ ] **Step 1: Thread `dialect` through the mixed parser (netlist-syntax)**
+
+In `crates/netlist-syntax/src/spectre_parser.rs`, add a `dialect: Dialect` field to `Parser` (after `dry: bool,` at `~86`):
+
+```rust
+    /// SPICE dialect used for any SPICE region (leading `.cir` region or a
+    /// mid-file `simulator lang=spice` handoff).
+    dialect: Dialect,
+```
+
+Change `Parser::new` (`94`) to take and store it:
+
+```rust
+    fn new(src: &'a str, dialect: Dialect) -> Self {
+        let raw = Lexer::tokenize(src, ERROR);
+        let mut p = Parser {
+            src, raw, p: 0, started: false,
+            nt: Sig { idx: 0, kind: ERROR },
+            nnt: Sig { idx: 0, kind: ERROR },
+            emit_idx: 0, builder: GreenNodeBuilder::new(),
+            errored: false, lang_swapped: false, dry: false,
+            dialect,
+        };
+        p.nt = p.next_sig();
+        p.nnt = p.next_sig();
+        p
+    }
+```
+
+In `handoff_to_spice` (`152-154`) use the field instead of the constant:
+
+```rust
+        let (builder, stop, errored) = crate::parser::parse_spice_region(
+            self.src,
+            self.dialect,
+            builder,
+```
+
+Change `parse_with` (`1285`) and `parse` (`1279`) to thread the dialect:
+
+```rust
+pub fn parse(src: &str) -> SyntaxNode {
+    parse_with(src, StartLang::Spectre, Dialect::Ngspice)
+}
+
+pub fn parse_with(src: &str, start_lang: StartLang, dialect: Dialect) -> SyntaxNode {
+    let mut p = Parser::new(src, dialect);
+    p.parse_toplevel(start_lang);
+    SyntaxNode::new_root(p.builder.finish())
+}
+```
+
+In `crates/netlist-syntax/src/lib.rs` (`45-47`) update `parse_spectre_with` and re-export `Dialect` if not already visible there (it is: `pub use lexer::Dialect;`):
+
+```rust
+/// Parse a netlist that may switch dialects via `simulator lang=`, starting in
+/// `start_lang`. `dialect` selects the SPICE dialect for any SPICE region.
+pub fn parse_spectre_with(src: &str, start_lang: StartLang, dialect: Dialect) -> SyntaxNode {
+    spectre_parser::parse_with(src, start_lang, dialect)
+}
+```
+
+Update the three external callers to pass an explicit dialect (`Dialect::Ngspice` is the sensible default for these test/example corpora):
+- `crates/netlist-syntax/tests/spectre_differential.rs:72` — `parse_spectre_with(&src, start_lang, netlist_syntax::Dialect::Ngspice)`
+- `crates/netlist-syntax/tests/roundtrip.rs:85` — `parse_spectre_with(&src, start_lang, netlist_syntax::Dialect::Ngspice)`
+- `crates/netlist-syntax/examples/dump_spectre.rs:19` — `parse_spectre_with(&src, start, netlist_syntax::Dialect::Ngspice)`
+
+- [ ] **Step 2: Verify netlist-syntax still builds and passes**
+
+Run: `cargo test -p netlist-syntax`
+Expected: PASS (threading refactor is behavior-preserving for the ngspice default; existing tests unaffected).
+
+- [ ] **Step 3: Write failing tests for the new FFI signatures**
 
 Add to the `#[cfg(test)] mod tests` in `crates/netlist-cxx/src/lib.rs`:
 
@@ -86,12 +164,12 @@ Also update the existing tests in this module mechanically:
 - `parse_netlist_lib(src, "tt")` → `parse_netlist_lib(src, "tt", "ngspice")`
 - Update the `use super::{...}` import line (`~993`) to drop `parse_spectre_netlist` and keep `parse_netlist, parse_netlist_lib`.
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [ ] **Step 4: Run tests to verify they fail**
 
 Run: `cargo test -p netlist-cxx`
 Expected: compile error / FAIL — `parse_netlist` still takes `bool`, new arg-count mismatch.
 
-- [ ] **Step 3: Implement the dialect-aware FFI**
+- [ ] **Step 5: Implement the dialect-aware FFI**
 
 In the `extern "Rust"` block (`crates/netlist-cxx/src/lib.rs:~199-207`) replace the three signatures with:
 
@@ -107,7 +185,7 @@ In the `extern "Rust"` block (`crates/netlist-cxx/src/lib.rs:~199-207`) replace 
     }
 ```
 
-Update the `use` at line 19 to bring in the dialect entry points:
+Update the `use` at line 19 to bring in the dialect entry points (`parse_spectre_with` is now 3-arg; `parse_spice_dialect` + `Dialect` are new):
 
 ```rust
 use netlist_syntax::{
@@ -116,7 +194,7 @@ use netlist_syntax::{
 };
 ```
 
-Replace `parse_netlist` / `parse_spectre_netlist` (`913-942`) with:
+Replace `parse_netlist` / `parse_spectre_netlist` (`913-942`) with the following. Note `parse_netlist` uses the **mixed parser for both** start languages (so `collect_scope` projection is unchanged from today); the dialect only affects SPICE regions:
 
 ```rust
 enum Lang {
@@ -154,33 +232,27 @@ fn empty_netlist() -> ffi::Netlist {
 }
 
 pub fn parse_netlist(src: &str, language: &str) -> ffi::Netlist {
-    match resolve_lang(language) {
-        Some(Lang::Spectre) => {
-            let root = parse_spectre_with(src, StartLang::Spectre);
-            let errors = collect_errors(&root);
-            let source = sast::SpectreNetlistSource::cast(root)
-                .expect("root is SpectreNetlistSource");
-            let scope = collect_scope(source.statements());
-            ffi::Netlist {
-                params: scope.params, models: scope.models, subckts: scope.subckts,
-                instances: scope.instances, analyses: scope.analyses, saves: scope.saves,
-                ics: scope.ics, globals: scope.globals, includes: scope.includes,
-                ahdl_includes: scope.ahdl_includes, errors, spice_blocks: scope.spice_blocks,
-            }
-        }
-        Some(Lang::Spice(dialect)) => {
-            let root = parse_spice_dialect(src, dialect);
-            let errors = collect_errors(&root);
-            let block = project_spice_block_children(root.children());
-            let mut nl = empty_netlist();
-            nl.spice_blocks.push(block);
-            nl.errors = errors;
-            nl
-        }
-        None => lang_error_netlist(),
+    let (start_lang, dialect) = match resolve_lang(language) {
+        // Spectre start: dialect is only consulted if a `simulator lang=spice`
+        // region appears; Ngspice is the harmless default there.
+        Some(Lang::Spectre) => (StartLang::Spectre, Dialect::Ngspice),
+        Some(Lang::Spice(d)) => (StartLang::Spice, d),
+        None => return lang_error_netlist(),
+    };
+    let root = parse_spectre_with(src, start_lang, dialect);
+    let errors = collect_errors(&root);
+    let source = sast::SpectreNetlistSource::cast(root).expect("root is SpectreNetlistSource");
+    let scope = collect_scope(source.statements());
+    ffi::Netlist {
+        params: scope.params, models: scope.models, subckts: scope.subckts,
+        instances: scope.instances, analyses: scope.analyses, saves: scope.saves,
+        ics: scope.ics, globals: scope.globals, includes: scope.includes,
+        ahdl_includes: scope.ahdl_includes, errors, spice_blocks: scope.spice_blocks,
     }
 }
 ```
+
+(`empty_netlist` is retained only for `lang_error_netlist`; `parse_netlist` no longer projects a SPICE block directly — `collect_scope` continues to nest SPICE content as `spice_blocks`, exactly as before.)
 
 Replace the head of `parse_netlist_lib` (`944-989`) so it takes and honors the dialect:
 
@@ -224,17 +296,19 @@ pub fn parse_netlist_lib(src: &str, section: &str, language: &str) -> ffi::Netli
 
 (The prior `parse_netlist_lib` used `parse_spice(src)`; it now uses `parse_spice_dialect(src, dialect)`. Remove the now-unused `use netlist_syntax::parse_spice;` line inside the old body.)
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [ ] **Step 6: Run tests to verify they pass**
 
-Run: `cargo test -p netlist-cxx`
-Expected: PASS (all new + updated tests).
+Run: `cargo test -p netlist-cxx && cargo test -p netlist-syntax`
+Expected: PASS (all new + updated tests in both crates).
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 cd /home/pepijn/code/nyanodide/NetlistParse.rs
-git add crates/netlist-cxx/src/lib.rs
-git commit -m "feat(ffi): dialect-aware parse_netlist/parse_netlist_lib (replace start_spice bool)"
+git add crates/netlist-syntax/src/spectre_parser.rs crates/netlist-syntax/src/lib.rs \
+        crates/netlist-syntax/tests/spectre_differential.rs crates/netlist-syntax/tests/roundtrip.rs \
+        crates/netlist-syntax/examples/dump_spectre.rs crates/netlist-cxx/src/lib.rs
+git commit -m "feat(parser): dialect-aware parse_spectre_with + dialect-string FFI (drop hardcoded ngspice / start_spice bool)"
 ```
 
 ---

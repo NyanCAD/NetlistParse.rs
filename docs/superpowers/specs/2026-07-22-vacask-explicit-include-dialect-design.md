@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-22
 **Status:** Design approved, ready for implementation plan
-**Repos touched:** `VACASK` (grammar + bridge, most of the work), `NetlistParse.rs` (FFI signature)
+**Repos touched:** `VACASK` (grammar + bridge, most of the work), `NetlistParse.rs` (FFI signature + a `dialect` parameter on the `netlist-syntax` mixed parser)
 
 ## Problem
 
@@ -60,9 +60,9 @@ Appendix for why.
 - **`lang=<dialect>`** → deferred to the **Rust bridge** with that explicit
   dialect. Accepted values: `ngspice | hspice | pspice | xyce | spectre`.
   - `ngspice/hspice/pspice/xyce` map to the parser's existing
-    `Dialect` enum (`netlist-syntax/src/lexer.rs:26`) via `parse_spice_dialect`.
-  - `spectre` routes through the bridge's Spectre parser (`parse_spectre`),
-    *not* the native path.
+    `Dialect` enum (`netlist-syntax/src/lexer.rs:26`), threaded into the mixed
+    parser via a new `dialect` parameter on `parse_spectre_with`.
+  - `spectre` routes through the bridge's Spectre parser, *not* the native path.
 
 `isForeignNetlistExt` and the extension-based SPICE/Spectre split in
 `netlistrs.cpp` are removed. Nothing selects a parser from the extension
@@ -114,14 +114,15 @@ extension.
   recursion; the `ext == ".scs"` / `ext != ".scs"` branches
   (`:927,1035,1143`) are removed.
 
-### Rust FFI (`crates/netlist-cxx/src/lib.rs`)
-- Replace `parse_netlist(src, start_spice: bool)` with a dialect-aware entry —
-  a dialect selector covering `{ngspice, hspice, pspice, xyce, spectre}`
-  (a shared enum across the cxx bridge, or a validated string mapped to
-  `Dialect` / `parse_spectre`).
-- `parse_netlist_lib(src, section, …)` gains the same dialect selector and uses
-  `parse_spice_dialect`. `parse_spectre_netlist` is subsumed by
-  `lang=spectre`.
+### Rust parser + FFI (`crates/netlist-syntax`, `crates/netlist-cxx/src/lib.rs`)
+- **`netlist-syntax`:** give the mixed parser a `dialect` — add `parse_spectre_with(src, start_lang, dialect)` and thread it to `handoff_to_spice`, removing the hardcoded `Dialect::Ngspice` (`spectre_parser.rs:154`). This keeps the current `SpectreNetlistSource` CST shape and `simulator lang=` switching.
+- **`netlist-cxx` FFI:** replace `parse_netlist(src, start_spice: bool)` with
+  `parse_netlist(src, language: &str)` — a validated dialect string mapped to
+  `Dialect` (SPICE dialects) or the Spectre start (`lang=spectre`), calling the
+  dialect-aware mixed parser so projection is unchanged from today.
+- `parse_netlist_lib(src, section, language)` gains the dialect and uses
+  `parse_spice_dialect` for section extraction. `parse_spectre_netlist` is
+  removed (subsumed by `lang=spectre`).
 - **Spectre-with-section is unsupported** — `parse_netlist_lib` matches SPICE
   `LibStatement` only. `lang=spectre section=…` is rejected with a clear error.
   (VACASK-native Spectre sections go through the native path, which handles them.)
