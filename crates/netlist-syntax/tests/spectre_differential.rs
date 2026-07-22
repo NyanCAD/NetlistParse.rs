@@ -69,7 +69,7 @@ fn spectre_corpus_differential() {
             Some("cir") => StartLang::Spice,
             _ => StartLang::Spectre,
         };
-        let got = netlist_syntax::dump::dump(&netlist_syntax::parse_spectre_with(&src, start_lang));
+        let got = netlist_syntax::dump::dump(&netlist_syntax::parse_spectre_with(&src, start_lang, netlist_syntax::Dialect::Ngspice));
         count += 1;
         if got.trim_end() != expected.trim_end() {
             failures.push(format!(

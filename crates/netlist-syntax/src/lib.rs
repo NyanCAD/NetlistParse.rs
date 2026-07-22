@@ -40,8 +40,7 @@ pub fn parse_spectre(src: &str) -> SyntaxNode {
 }
 
 /// Parse a netlist that may switch dialects via `simulator lang=`, starting in
-/// `start_lang` (`.scs` → Spectre, `.cir` → SPICE). The root is always
-/// `SpectreNetlistSource`.
-pub fn parse_spectre_with(src: &str, start_lang: StartLang) -> SyntaxNode {
-    spectre_parser::parse_with(src, start_lang)
+/// `start_lang`. `dialect` selects the SPICE dialect for any SPICE region.
+pub fn parse_spectre_with(src: &str, start_lang: StartLang, dialect: Dialect) -> SyntaxNode {
+    spectre_parser::parse_with(src, start_lang, dialect)
 }

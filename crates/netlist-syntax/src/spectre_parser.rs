@@ -84,6 +84,10 @@ pub struct Parser<'a> {
     /// governs whether the `SNodeList` (a plain assignment, not a captured
     /// `@trynext` value) appears at all. See `parse_instance`.
     dry: bool,
+
+    /// SPICE dialect used for any SPICE region (leading `.cir` region or a
+    /// mid-file `simulator lang=spice` handoff).
+    dialect: Dialect,
 }
 
 fn to_raw(kind: SyntaxKind) -> rowan::SyntaxKind {
@@ -91,26 +95,21 @@ fn to_raw(kind: SyntaxKind) -> rowan::SyntaxKind {
 }
 
 impl<'a> Parser<'a> {
-    fn new(src: &'a str) -> Self {
+    fn new(src: &'a str, dialect: Dialect) -> Self {
         let raw = Lexer::tokenize(src, ERROR);
         let mut p = Parser {
             src,
             raw,
             p: 0,
             started: false,
-            nt: Sig {
-                idx: 0,
-                kind: ERROR,
-            },
-            nnt: Sig {
-                idx: 0,
-                kind: ERROR,
-            },
+            nt: Sig { idx: 0, kind: ERROR },
+            nnt: Sig { idx: 0, kind: ERROR },
             emit_idx: 0,
             builder: GreenNodeBuilder::new(),
             errored: false,
             lang_swapped: false,
             dry: false,
+            dialect,
         };
         p.nt = p.next_sig();
         p.nnt = p.next_sig();
@@ -151,7 +150,7 @@ impl<'a> Parser<'a> {
         let builder = std::mem::replace(&mut self.builder, GreenNodeBuilder::new());
         let (builder, stop, errored) = crate::parser::parse_spice_region(
             self.src,
-            Dialect::Ngspice,
+            self.dialect,
             builder,
             start_byte,
             true,
@@ -1276,14 +1275,15 @@ impl<'a> Parser<'a> {
 /// Parse Spectre source into a lossless rowan CST rooted at
 /// `SpectreNetlistSource`.
 pub fn parse(src: &str) -> SyntaxNode {
-    parse_with(src, StartLang::Spectre)
+    parse_with(src, StartLang::Spectre, Dialect::Ngspice)
 }
 
 /// Parse a netlist that may switch dialects via `simulator lang=`, starting in
-/// `start_lang`. The root is always `SpectreNetlistSource`; SPICE regions nest
+/// `start_lang`. `dialect` selects the SPICE dialect for any SPICE region.
+/// The root is always `SpectreNetlistSource`; SPICE regions nest
 /// as `SPICENetlistSource` subtrees. Mirrors `SpectreNetlistCSTParser.parse`.
-pub fn parse_with(src: &str, start_lang: StartLang) -> SyntaxNode {
-    let mut p = Parser::new(src);
+pub fn parse_with(src: &str, start_lang: StartLang, dialect: Dialect) -> SyntaxNode {
+    let mut p = Parser::new(src, dialect);
     p.parse_toplevel(start_lang);
     SyntaxNode::new_root(p.builder.finish())
 }

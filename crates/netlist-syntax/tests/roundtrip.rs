@@ -82,7 +82,7 @@ fn roundtrip_all_spectre_corpus() {
             Some("cir") => StartLang::Spice,
             _ => StartLang::Spectre,
         };
-        let tree = netlist_syntax::parse_spectre_with(&src, start_lang);
+        let tree = netlist_syntax::parse_spectre_with(&src, start_lang, netlist_syntax::Dialect::Ngspice);
         assert_eq!(
             tree.text().to_string(),
             src,

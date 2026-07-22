@@ -16,7 +16,10 @@
 
 use netlist_syntax::ast::{self, AstNode};
 use netlist_syntax::spectre_ast as sast;
-use netlist_syntax::{parse_spectre_with, StartLang, SyntaxKind, SyntaxNode, SyntaxToken};
+use netlist_syntax::{
+    parse_spectre_with, parse_spice_dialect, Dialect, StartLang, SyntaxKind, SyntaxNode,
+    SyntaxToken,
+};
 
 #[cxx::bridge(namespace = "netlist")]
 mod ffi {
@@ -192,18 +195,13 @@ mod ffi {
     }
 
     extern "Rust" {
-        /// Parse netlist source and project it into a flat, owned `Netlist`.
-        /// `start_spice` selects the starting dialect (`.cir` → true / SPICE,
-        /// `.scs` → false / Spectre); a `simulator lang=` line may still switch
-        /// mid-file.
-        fn parse_netlist(src: &str, start_spice: bool) -> Netlist;
-        /// Back-compat: parse starting in the Spectre dialect.
-        fn parse_spectre_netlist(src: &str) -> Netlist;
-        /// Parse a SPICE `.lib` file and project only the content from the
-        /// named section (`.lib <section>` … `.endl <section>`). Top-level
-        /// content outside any section is included unconditionally (parameters,
-        /// includes, etc. that precede the first `.lib` block).
-        fn parse_netlist_lib(src: &str, section: &str) -> Netlist;
+        /// Parse foreign netlist source into a flat `Netlist`. `language` is one
+        /// of ngspice|hspice|pspice|xyce|spectre (case-insensitive). SPICE
+        /// dialects use the SPICE parser; `spectre` uses the Spectre parser.
+        fn parse_netlist(src: &str, language: &str) -> Netlist;
+        /// Parse a SPICE `.lib` file (dialect per `language`) and project only
+        /// the named section. `language=spectre` is unsupported (errors).
+        fn parse_netlist_lib(src: &str, section: &str, language: &str) -> Netlist;
     }
 }
 
@@ -910,52 +908,74 @@ fn collect_errors(root: &SyntaxNode) -> Vec<ffi::ParseError> {
         .collect()
 }
 
-pub fn parse_netlist(src: &str, start_spice: bool) -> ffi::Netlist {
-    let lang = if start_spice {
-        StartLang::Spice
-    } else {
-        StartLang::Spectre
+enum Lang {
+    Spice(Dialect),
+    Spectre,
+}
+
+fn resolve_lang(name: &str) -> Option<Lang> {
+    match name.to_ascii_lowercase().as_str() {
+        "ngspice" => Some(Lang::Spice(Dialect::Ngspice)),
+        "hspice" => Some(Lang::Spice(Dialect::Hspice)),
+        "pspice" => Some(Lang::Spice(Dialect::Pspice)),
+        "xyce" => Some(Lang::Spice(Dialect::Xyce)),
+        "spectre" => Some(Lang::Spectre),
+        _ => None,
+    }
+}
+
+/// A `Netlist` carrying a single synthetic parse error (byte range 0..0), used
+/// when the requested dialect is invalid/unsupported. C++ surfaces it as a
+/// parse error; the authoritative, user-facing message is produced in
+/// `mergeForeignFile` before this is reached.
+fn lang_error_netlist() -> ffi::Netlist {
+    let mut nl = empty_netlist();
+    nl.errors.push(ffi::ParseError { start: 0, end: 0 });
+    nl
+}
+
+fn empty_netlist() -> ffi::Netlist {
+    ffi::Netlist {
+        params: vec![], models: vec![], subckts: vec![], instances: vec![],
+        analyses: vec![], saves: vec![], ics: vec![], globals: vec![],
+        includes: vec![], ahdl_includes: vec![], errors: vec![], spice_blocks: vec![],
+    }
+}
+
+pub fn parse_netlist(src: &str, language: &str) -> ffi::Netlist {
+    let (start_lang, dialect) = match resolve_lang(language) {
+        // Spectre start: dialect is only consulted if a `simulator lang=spice`
+        // region appears; Ngspice is the harmless default there.
+        Some(Lang::Spectre) => (StartLang::Spectre, Dialect::Ngspice),
+        Some(Lang::Spice(d)) => (StartLang::Spice, d),
+        None => return lang_error_netlist(),
     };
-    let root = parse_spectre_with(src, lang);
+    let root = parse_spectre_with(src, start_lang, dialect);
     let errors = collect_errors(&root);
     let source = sast::SpectreNetlistSource::cast(root).expect("root is SpectreNetlistSource");
     let scope = collect_scope(source.statements());
     ffi::Netlist {
-        params: scope.params,
-        models: scope.models,
-        subckts: scope.subckts,
-        instances: scope.instances,
-        analyses: scope.analyses,
-        saves: scope.saves,
-        ics: scope.ics,
-        globals: scope.globals,
-        includes: scope.includes,
-        ahdl_includes: scope.ahdl_includes,
-        errors,
-        spice_blocks: scope.spice_blocks,
+        params: scope.params, models: scope.models, subckts: scope.subckts,
+        instances: scope.instances, analyses: scope.analyses, saves: scope.saves,
+        ics: scope.ics, globals: scope.globals, includes: scope.includes,
+        ahdl_includes: scope.ahdl_includes, errors, spice_blocks: scope.spice_blocks,
     }
 }
 
-/// Back-compat wrapper: parse starting in Spectre.
-pub fn parse_spectre_netlist(src: &str) -> ffi::Netlist {
-    parse_netlist(src, false)
-}
+/// Parse a SPICE `.lib` file (given `language` dialect) and project only the
+/// matching section. `spectre` is unsupported.
+pub fn parse_netlist_lib(src: &str, section: &str, language: &str) -> ffi::Netlist {
+    let dialect = match resolve_lang(language) {
+        Some(Lang::Spice(d)) => d,
+        Some(Lang::Spectre) | None => return lang_error_netlist(),
+    };
 
-/// Parse a SPICE `.lib` file and project only the matching section.
-pub fn parse_netlist_lib(src: &str, section: &str) -> ffi::Netlist {
-    use netlist_syntax::parse_spice;
-
-    let root = parse_spice(src);
+    let root = parse_spice_dialect(src, dialect);
     let errors = collect_errors(&root);
 
     let mut block = ffi::SpiceBlock {
-        params: vec![],
-        models: vec![],
-        subckts: vec![],
-        devices: vec![],
-        includes: vec![],
+        params: vec![], models: vec![], subckts: vec![], devices: vec![], includes: vec![],
     };
-
     for child in root.children() {
         if child.kind() == SyntaxKind::LibStatement {
             if let Some(lib) = ast::LibStatement::cast(child) {
@@ -972,34 +992,25 @@ pub fn parse_netlist_lib(src: &str, section: &str) -> ffi::Netlist {
         }
     }
 
-    ffi::Netlist {
-        params: vec![],
-        models: vec![],
-        subckts: vec![],
-        instances: vec![],
-        analyses: vec![],
-        saves: vec![],
-        ics: vec![],
-        globals: vec![],
-        includes: vec![],
-        ahdl_includes: vec![],
-        errors,
-        spice_blocks: vec![block],
-    }
+    let mut nl = empty_netlist();
+    nl.spice_blocks.push(block);
+    nl.errors = errors;
+    nl
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_netlist, parse_netlist_lib, parse_spectre_netlist};
+    use super::{parse_netlist, parse_netlist_lib};
 
     #[test]
     fn projects_top_level() {
-        let nl = parse_spectre_netlist(
+        let nl = parse_netlist(
             "simulator lang=spectre\n\
              parameters vdd=1.8\n\
              r1 (a b) resistor r=1k\n\
              model nch bsim4 l=1u\n\
              stepResponse tran stop=100ns\n",
+            "spectre",
         );
         assert_eq!(nl.params.len(), 1);
         assert_eq!(nl.params[0].name, "vdd");
@@ -1016,7 +1027,7 @@ mod tests {
 
     #[test]
     fn projects_nested_subckt_and_conditional() {
-        let nl = parse_spectre_netlist(
+        let nl = parse_netlist(
             "subckt s1 (d g s b)\n\
              parameters l=1u\n\
              if ( l < 0.5u ) {\n\
@@ -1025,6 +1036,7 @@ mod tests {
              m2 (d g s b) longmod l=l\n\
              }\n\
              ends s1\n",
+            "spectre",
         );
         assert_eq!(nl.subckts.len(), 1);
         let s = &nl.subckts[0];
@@ -1042,7 +1054,7 @@ mod tests {
 
     #[test]
     fn collects_include_and_errors() {
-        let nl = parse_spectre_netlist("include \"models.scs\" section=tt\n");
+        let nl = parse_netlist("include \"models.scs\" section=tt\n", "spectre");
         assert_eq!(nl.includes.len(), 1);
         assert_eq!(nl.includes[0].path, "models.scs");
         assert_eq!(nl.includes[0].section, "tt");
@@ -1050,7 +1062,7 @@ mod tests {
 
     #[test]
     fn projects_spice_block_passives() {
-        let nl = super::parse_netlist("* t\nR1 a b 1k\nC1 b 0 1u\nL1 a b 2n\n", true);
+        let nl = super::parse_netlist("* t\nR1 a b 1k\nC1 b 0 1u\nL1 a b 2n\n", "ngspice");
         assert!(nl.errors.is_empty());
         assert_eq!(nl.spice_blocks.len(), 1);
         let d = &nl.spice_blocks[0].devices;
@@ -1082,7 +1094,7 @@ mod tests {
              .param cint=1p\n\
              R1 a b rint\n\
              .ends\n",
-            true,
+            "ngspice",
         );
         assert!(nl.errors.is_empty(), "unexpected parse errors");
         assert_eq!(nl.spice_blocks.len(), 1);
@@ -1102,7 +1114,7 @@ mod tests {
     fn projects_spice_sources() {
         let nl = super::parse_netlist(
             "* t\nV1 1 0 DC 5 AC 1 PULSE(0 5 1m 1u 1u 4m 10m)\nI1 0 2 DC 1m\n",
-            true,
+            "ngspice",
         );
         assert!(nl.errors.is_empty(), "unexpected parse errors");
         assert_eq!(nl.spice_blocks.len(), 1);
@@ -1137,7 +1149,7 @@ mod tests {
             X1 in out amp gain=2\n\
             .model dmod d is=1e-14\n\
             .subckt amp in out\n R1 in out 1k\n .ends\n";
-        let nl = super::parse_netlist(src, true);
+        let nl = super::parse_netlist(src, "ngspice");
         let b = &nl.spice_blocks[0];
         // MOSFET
         let m = b.devices.iter().find(|x| x.name == "M1").unwrap();
@@ -1178,7 +1190,7 @@ mod tests {
     fn projects_malformed_bjt_subckt_no_panic() {
         // Bare device names only — parser produces minimal/error AST nodes with
         // very few HierarchialNode children, exercising the len<2 guard.
-        let nl = super::parse_netlist("* t\nQ1\nX1\n", true);
+        let nl = super::parse_netlist("* t\nQ1\nX1\n", "ngspice");
         // Must not panic; any devices that project should have empty nodes/model.
         for dev in &nl.spice_blocks[0].devices {
             assert!(
@@ -1200,7 +1212,7 @@ mod tests {
             G1 o 0 a b 1e-3\n\
             F1 o 0 vsense 10\n\
             .include \"models.spice\"\n";
-        let nl = super::parse_netlist(src, true);
+        let nl = super::parse_netlist(src, "ngspice");
         let b = &nl.spice_blocks[0];
         // E1 — voltage-controlled voltage source
         let e = b.devices.iter().find(|x| x.name == "E1").unwrap();
@@ -1248,7 +1260,7 @@ mod tests {
             .subckt amp in out\n R1 in out 1k\n .ends\n\
             .include \"models.spice\"\n\
             .lib \"mylib.sp\" tt\n";
-        let nl = super::parse_netlist(src, true);
+        let nl = super::parse_netlist(src, "ngspice");
         assert!(
             nl.errors.is_empty(),
             "unexpected parse errors: {} error(s)",
@@ -1282,7 +1294,7 @@ mod tests {
 .param vth0_nfet = 0.35\n\
 .model nfet_ff nmos level=54\n\
 .endl ff\n";
-        let nl = parse_netlist_lib(src, "tt");
+        let nl = parse_netlist_lib(src, "tt", "ngspice");
         assert!(
             nl.errors.is_empty(),
             "parse errors: {} error(s)",
@@ -1296,13 +1308,13 @@ mod tests {
         assert_eq!(b.models.len(), 1);
         assert_eq!(b.models[0].name, "nfet");
 
-        let nl_ff = parse_netlist_lib(src, "ff");
+        let nl_ff = parse_netlist_lib(src, "ff", "ngspice");
         let b_ff = &nl_ff.spice_blocks[0];
         assert_eq!(b_ff.params.len(), 1);
         assert_eq!(b_ff.params[0].value, "0.35");
         assert_eq!(b_ff.models[0].name, "nfet_ff");
 
-        let nl_miss = parse_netlist_lib(src, "ss");
+        let nl_miss = parse_netlist_lib(src, "ss", "ngspice");
         let b_miss = &nl_miss.spice_blocks[0];
         assert!(b_miss.params.is_empty());
         assert!(b_miss.models.is_empty());
@@ -1311,7 +1323,7 @@ mod tests {
     #[test]
     fn parse_lib_case_insensitive() {
         let src = "* t\n.lib TT\n.param x=1\n.endl TT\n";
-        let nl = parse_netlist_lib(src, "tt");
+        let nl = parse_netlist_lib(src, "tt", "ngspice");
         assert_eq!(nl.spice_blocks[0].params.len(), 1);
     }
 
@@ -1324,17 +1336,56 @@ mod tests {
         // `simulator lang=spectre` switch, control returns to the Spectre driver
         // and the trailing Spectre instance r2 projects. (SPICE-device projection
         // of the leading block is deferred to Task 7 — not asserted here.)
-        let spice = parse_netlist(src, /*start_spice=*/ true);
+        let spice = parse_netlist(src, "ngspice");
         assert!(spice.errors.is_empty(), "spice-start should parse cleanly");
         assert_eq!(spice.instances.len(), 1);
         assert_eq!(spice.instances[0].name, "r2");
 
         // Start in Spectre: the same leading SPICE line `R1 a b 1k` is invalid
         // Spectre and produces error node(s).
-        let spectre = parse_netlist(src, /*start_spice=*/ false);
+        let spectre = parse_netlist(src, "spectre");
         assert!(
             !spectre.errors.is_empty(),
             "spectre-start should error on the SPICE line"
         );
+    }
+
+    #[test]
+    fn parse_netlist_ngspice_projects_spice_block() {
+        let nl = super::parse_netlist("* t\nR1 a b 1k\n", "ngspice");
+        assert!(nl.errors.is_empty(), "unexpected errors: {}", nl.errors.len());
+        assert_eq!(nl.spice_blocks.len(), 1);
+        assert_eq!(nl.spice_blocks[0].devices.len(), 1);
+    }
+
+    #[test]
+    fn parse_netlist_accepts_all_spice_dialects() {
+        for d in ["ngspice", "hspice", "pspice", "xyce"] {
+            let nl = super::parse_netlist("* t\nR1 a b 1k\n", d);
+            assert!(nl.errors.is_empty(), "dialect {d} errored");
+            assert_eq!(nl.spice_blocks.len(), 1, "dialect {d} block count");
+        }
+    }
+
+    #[test]
+    fn parse_netlist_unknown_lang_errors() {
+        let nl = super::parse_netlist("* t\nR1 a b 1k\n", "bogus");
+        assert!(!nl.errors.is_empty());
+    }
+
+    #[test]
+    fn parse_netlist_lib_dialect_extracts_section() {
+        // A SPICE title line is required (first line is always consumed as title).
+        let src = "* t\n.lib tt\nR1 a b 1k\n.endl tt\n.lib ff\nR1 a b 2k\n.endl ff\n";
+        let nl = super::parse_netlist_lib(src, "tt", "ngspice");
+        assert!(nl.errors.is_empty());
+        assert_eq!(nl.spice_blocks.len(), 1);
+        assert_eq!(nl.spice_blocks[0].devices.len(), 1);
+    }
+
+    #[test]
+    fn parse_netlist_lib_spectre_is_unsupported() {
+        let nl = super::parse_netlist_lib(".lib tt\n.endl tt\n", "tt", "spectre");
+        assert!(!nl.errors.is_empty());
     }
 }
