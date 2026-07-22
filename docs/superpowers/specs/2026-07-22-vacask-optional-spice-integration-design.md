@@ -103,50 +103,71 @@ module itself is also skipped.
 - When `OFF`, `netlistrs.o` is not built, so the `netlist::` cxx symbols are
   never referenced and the binary links with no Rust artifacts at all.
 
-### 3. Main-binary wiring — the include-dispatch seam
+### 3. Main-binary wiring — the include-dispatch seam (stash + drain)
 
-Interception point: the two include-resolution end-states in
-`VACASK/lib/dfllexer.l`:
-- `<INCEND>\n` (~line 303): `include "file"` without a section.
-- `<LIBEND>\n` (~line 371): `include "file" section=name`.
+**Critical constraint discovered in the grammar** (`lib/dflparser.y`): the native
+parser builds the toplevel circuit as a **parser-stack semantic value**
+(`subckt_build`'s `$$.def`); models, instances, and nested subckt definitions
+are accumulated there (lines 334/338/342/346) and the whole thing is committed
+to the table only at the **end** of the netlist rule via
+`tables.setDefaultSubDef(std::move($2.def))` (line 261). Only *tab-level*
+members — `load`, `global`, `ground`, `embed`, `control`/commands — are written
+to `tables` **live** during parsing (lines 357/369/380/390).
 
-Both currently resolve a canonical path via `tables.fileStack().addFile(...)`
-then `yypush_buffer_state(...)` to lex the included file natively. New behavior,
-after `fname` is resolved and before the native buffer push:
+Therefore a scanner-level merge into `tab.defaultSubDef()` would be **silently
+overwritten** at line 261. It works for OSDI *loads* (tab-level, survive) but
+loses foreign *models/subckts/devices*. The seam is split accordingly:
 
-- If `fname`'s (lowercased) extension is in the **foreign set** → call a new
-  helper `mergeForeignFile(fname, section, tables, p, s)` that parses the file
-  through the Rust adapter and `mergeNetlist`s its models/subckts/devices into
-  the **existing** live table, then **continue scanning the parent file** (no
-  buffer push, no new lexer state). On adapter error, emit `error(*loc, ...)`
-  and return `token::YYerror`.
-- Otherwise (`.sim`, or unknown) → existing native buffer push, unchanged.
+**Interception point** — the two include-resolution end-states in
+`lib/dfllexer.l`: `<INCEND>\n` (~303, no section) and `<LIBEND>\n` (~371, with
+`section=name`). After `fname` is resolved, before the native
+`yypush_buffer_state`:
+
+- If `fname`'s (lowercased) extension is in the **foreign set** → **stash**
+  `{path, section}` into a tab-level pending list (`tables.addPendingForeign(...)`)
+  and **skip** the native buffer push (keep scanning the parent). Do *not* merge
+  here.
+- Otherwise (`.sim` / unknown) → existing native buffer push, unchanged.
 - Under `#else` (SPICE compiled out): a foreign extension →
-  `error(*loc, "include of a SPICE/Spectre file requires a build with "
-  "-DVACASK_WITH_SPICE=ON")` and return `token::YYerror`.
+  `error(*loc, "include of a SPICE/Spectre file requires -DVACASK_WITH_SPICE=ON")`
+  and `return(token::YYerror)`.
 
-**Foreign extension set:**
-- SPICE start language: `.cir`, `.sp`, `.spice`, `.mod`, `.lib`
-- Spectre start language: `.scs`, `.spectre`
+**Drain point** — the `output : INNETLIST subckt_build END` action
+(`dflparser.y` ~258), immediately before `setDefaultSubDef`: for each stashed
+foreign include, call
+`mergeForeignFile(path, section, /*top=*/$2.def, tables, p, s)`, which parses via
+the Rust adapter and merges its models/instances/subckts into the toplevel def
+`$2.def` and emits OSDI loads into `tables`. On error → `YYERROR`. Because
+foreign content is declarations (order-independent), end-of-parse draining is
+correct; loads were already written live at stash-time is **not** the case here
+— loads are emitted at drain time (inside `mergeForeignFile`), which still runs
+before `verify()` at line 264.
 
-This reuses the extension→language logic already present in
+**Foreign extension set:** SPICE = `.cir .sp .spice .mod .lib`;
+Spectre = `.scs .spectre`. Reuses the ext→language logic in
 `buildParserTablesFromFile`.
 
-**Why a new `mergeForeignFile` helper instead of calling
-`buildParserTablesFromFile`:** the latter is a *top-level* entry — it calls
-`tab.defaultGround()` and `tab.setDefaultSubDef(...)`, i.e. it (re)initializes a
-fresh table. An include must merge into the *existing* default subcircuit
-definition. `mergeForeignFile` factors out just the parse + `mergeNetlist`
-into the live table's current top. Nested includes *inside* the foreign file
-continue to be handled by `mergeNetlist`'s existing recursion (it already
-routes `.lib` sections via `parse_netlist_lib` and other files via
-`parse_netlist`).
+**Toplevel-only.** Foreign includes are supported only in the toplevel circuit,
+not inside a `subckt` body — the stash list is tab-global and cannot be
+attributed to an in-progress nested subdef. This matches an already-documented
+adapter limitation ("Includes nested inside subckt bodies: Subckt does not carry
+includes"). A foreign include inside a subckt body is drained into the toplevel
+def (documented limitation), not silently dropped.
 
-**Parser handle:** `mergeNetlist` needs a `Parser&` for expression parsing.
-The scanner has `tables` (the `ParserTables&`) but not necessarily a `Parser`.
-`mergeForeignFile` constructs a transient `Parser p(tables)` for the merge.
-(Implementation detail to verify during TDD — confirm a transient Parser is
-sufficient and does not disturb the in-flight native parse.)
+**`mergeForeignFile` signature:**
+`bool mergeForeignFile(const std::string& path, const std::string& section,
+PTSubcircuitDefinition& top, ParserTables& tab, Parser& p, Status& s)` — a thin
+wrapper over `mergeNetlist(..., top, tab, ..., projectAnalyses=false)` that
+selects SPICE vs Spectre by extension, routes `section` via `parse_netlist_lib`,
+suppresses command/analysis projection (warns if present), and calls
+`emitOsdiLoads`. It does **not** call `defaultGround()`/`setDefaultSubDef` (those
+remain the grammar's job).
+
+**Parser handle:** the drain runs inside the bison action, which has `tables`
+and `status` but no `sim::Parser`. Construct a transient `sim::Parser p(tables)`
+in the action for the merge (its `parseParameters`/`parseExpression` spin up
+their own string-backed scanner/parser, so it is independent of the in-flight
+parse). Verify reentrancy during implementation.
 
 **Commands inside foreign includes:** ignored, but **warn** — surface a stray
 `.tran`/`.dc`/`.op`/etc. on stderr (do not silently swallow). The warning names

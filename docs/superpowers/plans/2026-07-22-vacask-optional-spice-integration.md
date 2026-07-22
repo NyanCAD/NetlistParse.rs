@@ -49,7 +49,7 @@
 **Interfaces:**
 - Produces:
   - `void emitOsdiLoads(ParserTables& tab, const std::set<std::string>& masters);` — maps each master to its `.osdi` file and adds a `PTLoad` for it, skipping builtins and de-duplicating against loads already present in `tab`.
-  - `bool mergeForeignFile(const std::string& path, const std::string& section, ParserTables& tab, Parser& p, Status& s);` — parse `path` (SPICE/Spectre by extension), `mergeNetlist` its models/subckts/devices into `tab`'s **existing** default subdef, **suppress** analysis/command projection (warn if any present), then `emitOsdiLoads` for referenced masters. `section` empty = whole file; non-empty = `.lib`-style section.
+  - `bool mergeForeignFile(const std::string& path, const std::string& section, PTSubcircuitDefinition& top, ParserTables& tab, Parser& p, Status& s);` — parse `path` (SPICE/Spectre by extension), `mergeNetlist` its models/subckts/devices into the caller-provided `top` (the grammar's in-progress toplevel def, NOT `tab.defaultSubDef()`), **suppress** analysis/command projection (warn if any present), then `emitOsdiLoads` for referenced masters into `tab`. `section` empty = whole file; non-empty = `.lib`-style section. Does NOT call `defaultGround()`/`setDefaultSubDef()`.
   - `mergeNetlist(...)` gains a trailing out-param `std::set<std::string>& masters` (populated with every OSDI master it references) and a bool `projectAnalyses` (default `true`).
 
 - [ ] **Step 1 (failing test):** Edit `demo_netlistrs.cpp` — delete the hardcoded `tab.add(PTLoad(...))...` block (lines 34-43). Leave the `buildParserTablesFromFile` call. This makes the demo depend on auto-emit.
@@ -91,7 +91,8 @@ void emitOsdiLoads(ParserTables& tab, const std::set<std::string>& masters) {
 
 ```cpp
 bool mergeForeignFile(const std::string& path, const std::string& section,
-                      ParserTables& tab, Parser& p, Status& s) {
+                      PTSubcircuitDefinition& top, ParserTables& tab,
+                      Parser& p, Status& s) {
     namespace fs = std::filesystem;
     fs::path fp(path);
     std::string ext = fp.extension().string();
@@ -112,8 +113,8 @@ bool mergeForeignFile(const std::string& path, const std::string& section,
     fs::path absPath; try { absPath = fs::canonical(fp); } catch (...) { absPath = fs::absolute(fp); }
     std::set<fs::path> visited{ absPath };
     std::set<std::string> addedModels, masters;
-    // Merge into the EXISTING default subdef (not a fresh one).
-    PTSubcircuitDefinition& top = tab.defaultSubDef();
+    // Merge into the caller's toplevel def (the grammar's $2.def), NOT
+    // tab.defaultSubDef() — that is overwritten by the parser at end-of-parse.
     if (!mergeNetlist(nl, top, tab, p, absPath.parent_path(), visited, addedModels, masters,
                       /*projectAnalyses=*/false, s))
         return false;
@@ -122,7 +123,7 @@ bool mergeForeignFile(const std::string& path, const std::string& section,
 }
 ```
 
-> Confirm `ParserTables::defaultSubDef()` returns a mutable ref to the current top; if the API differs (e.g. top is only set via `setDefaultSubDef`), merge into a local `top` seeded from the current default and set it back. Verify against `parseroutput.h` during implementation.
+> `ParserTables::defaultSubDef()` returns a mutable ref (`parseroutput.h:747`) but is NOT the merge target — see Task 4. `top` is supplied by the grammar drain action.
 
 - [ ] **Step 7 (header):** In `netlistrs.h`, declare `emitOsdiLoads` and `mergeForeignFile`; update the stale "PTLoads are NOT added here" comments to note auto-emission.
 - [ ] **Step 8 (verify pass):** `cmake --build build && ctest --test-dir build -R demo_netlistrs_spice -V`. Expected: all `demo_netlistrs_spice_*` PASS with the hardcoded loads gone (auto-emit replaced them).
@@ -190,19 +191,35 @@ Remove `netlistrs.cpp` (and, if desired, `../include/netlistrs.h`) from the unco
 
 ---
 
-### Task 4: Scanner include dispatch (`dfllexer.l`)
+### Task 4: Scanner stash + grammar drain of foreign includes
 
 **Files:**
-- Modify: `VACASK/lib/dfllexer.l` (`<INCEND>\n` ~303, `<LIBEND>\n` ~371)
+- Modify: `VACASK/include/parseroutput.h` (add pending-foreign staging to `ParserTables`)
+- Modify: `VACASK/lib/dfllexer.l` (`<INCEND>\n` ~303, `<LIBEND>\n` ~371 — stash, skip native push)
+- Modify: `VACASK/lib/dflparser.y` (`output : INNETLIST subckt_build END` ~258 — drain)
 
 **Interfaces:**
 - Consumes: `sim::mergeForeignFile` (Task 2), `VACASK_WITH_SPICE` define (Task 3).
+- Produces on `ParserTables`:
+  - `struct PendingForeign { std::string path; std::string section; };`
+  - `ParserTables& addPendingForeign(std::string path, std::string section) &;`
+  - `std::vector<PendingForeign>& pendingForeign();`
 
-- [ ] **Step 1 (helper in lexer prologue):** In the `%{ ... %}` C prologue of `dfllexer.l`, add a foreign-extension predicate and include the adapter header under the guard:
+- [ ] **Step 1 (staging on ParserTables):** In `parseroutput.h`, inside `class ParserTables`, add (near `loads_`):
+
+```cpp
+    struct PendingForeign { std::string path; std::string section; };
+    ParserTables& addPendingForeign(std::string path, std::string section) & {
+        pendingForeign_.push_back({std::move(path), std::move(section)}); return *this; }
+    std::vector<PendingForeign>& pendingForeign() { return pendingForeign_; }
+    // ... in the private members section:
+    std::vector<PendingForeign> pendingForeign_;
+```
+
+- [ ] **Step 2 (foreign-ext predicate + guarded include in lexer prologue):** In the `%{ ... %}` C prologue of `dfllexer.l`, ensure `<algorithm>`/`<string>` are included, then add under the guard:
 
 ```cpp
 #ifdef VACASK_WITH_SPICE
-#include "netlistrs.h"
 static bool isForeignNetlistExt(const std::string& path) {
     auto dot = path.find_last_of('.');
     if (dot == std::string::npos) return false;
@@ -214,37 +231,56 @@ static bool isForeignNetlistExt(const std::string& path) {
 #endif
 ```
 
-- [ ] **Step 2 (INCEND — no section):** In `<INCEND>\n`, after `fname` is resolved (line ~321) and BEFORE `pushStream`/`yypush_buffer_state`, insert:
+- [ ] **Step 3 (INCEND — no section):** In `<INCEND>\n`, BEFORE `fileStack().addFile(...)`/`pushStream`/`yypush_buffer_state`, restructure so foreign files stash and skip the native push. The filename is `sbuf` (resolution to canonical happens via `addFile`; for the stash we resolve relative to the current file dir / include path — reuse `Simulator::includePath()` semantics or store the raw `sbuf` and let `mergeForeignFile` resolve). Simplest correct form: still call `addFile` to get the canonical path, then branch:
 
 ```cpp
+                    auto& fname = tables.fileStack().canonicalName(fileStackPosition);
 #ifdef VACASK_WITH_SPICE
                     if (isForeignNetlistExt(fname)) {
-                        sim::Parser fp(tables);
-                        Status fs;
-                        if (!sim::mergeForeignFile(fname, "", tables, fp, fs)) {
-                            error(*loc, fs.message());
-                            return(token::YYerror);
-                        }
-                        // merged in place; do NOT switch buffers, keep scanning parent
-                        loc->lines(); // already consumed the newline
-                        break; // skip native buffer push for this include
-                    }
+                        tables.addPendingForeign(fname, "");
+                        // do NOT push a buffer; keep scanning the parent file
+                    } else
 #else
                     if (isForeignNetlistExt(fname)) {
                         error(*loc, std::string("include of SPICE/Spectre file '")+fname+
                               "' requires a build with -DVACASK_WITH_SPICE=ON");
                         return(token::YYerror);
-                    }
+                    } else
 #endif
+                    {
+                        auto streamPtr = pushStream(fname, *loc);
+                        if (!streamPtr) { error(*loc, std::string("Failed to open include file '")+fname+"'."); return(token::YYerror); }
+                        yypush_buffer_state(yy_create_buffer(*streamPtr, YY_BUF_SIZE));
+                        loc->end.initialize(nullptr, 1, 1, 0);
+                        loc->end.setFileStack(tables.fileStack(), fileStackPosition);
+                        loc->begin = loc->end;
+                    }
 ```
 
-> `break` exits the flex action's enclosing block if structured as such; if not, restructure the native buffer-push into an `else` branch so foreign files skip it. Verify control flow during implementation — the goal is: foreign → merge + continue; native → existing push.
+> Preserve the exact existing native-push body (lines ~321-334) inside the `else {}`. The stash branch must still leave the lexer in a sane state to continue the parent (the `yy_pop_state()` calls that precede this action already returned to INC/LINESTART).
 
-- [ ] **Step 3 (LIBEND — with section):** Same insertion in `<LIBEND>\n` (line ~376+), passing the captured `section` instead of `""`:
-  `sim::mergeForeignFile(fname, section, tables, fp, fs)`.
-- [ ] **Step 4:** Confirm the lexer includes `<algorithm>`/`<string>` for `std::transform` (add to prologue if missing).
-- [ ] **Step 5 (build):** `cmake --build build`. Expected: flex regenerates, compiles clean.
-- [ ] **Step 6 (commit):** `feat(parser): dispatch foreign-format includes to the Rust adapter`.
+- [ ] **Step 4 (LIBEND — with section):** Same restructure in `<LIBEND>\n` (~376), stashing the captured `section`: `tables.addPendingForeign(fname, section);` in the foreign branch; keep the native library-file push (including `setSection`) in the `else {}`.
+- [ ] **Step 5 (grammar drain):** In `dflparser.y`, `output : INNETLIST subckt_build END` action (~258), after `$2.def.add(std::move($2.parameters));` and BEFORE `tables.setDefaultSubDef(...)`:
+
+```cpp
+#ifdef VACASK_WITH_SPICE
+    {
+        sim::Parser mp(tables);
+        for (auto& fi : tables.pendingForeign()) {
+            if (!sim::mergeForeignFile(fi.path, fi.section, $2.def, tables, mp, status)) {
+                YYERROR;
+            }
+        }
+        tables.pendingForeign().clear();
+    }
+#endif
+    tables.setDefaultSubDef(std::move($2.def));
+```
+
+Add `#include "netlistrs.h"` to the grammar's C prologue under `#ifdef VACASK_WITH_SPICE` (guarded so the OFF build, which omits `netlistrs.h`/its symbols, still compiles).
+
+- [ ] **Step 6 (build):** `cmake --build build`. Expected: flex+bison regenerate, compile+link clean (bridge linked via simlib PUBLIC).
+- [ ] **Step 7 (commit):** `feat(parser): stash foreign-format includes and drain them into the toplevel def`.
 
 ---
 
