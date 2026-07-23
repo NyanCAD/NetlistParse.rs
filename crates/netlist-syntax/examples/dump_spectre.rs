@@ -16,7 +16,7 @@ fn main() -> ExitCode {
         _ => StartLang::Spectre,
     };
     let src = std::fs::read_to_string(&path).unwrap();
-    let tree = netlist_syntax::parse_spectre_with(&src, start);
+    let tree = netlist_syntax::parse_spectre_with(&src, start, netlist_syntax::Dialect::Ngspice);
     print!("{}", netlist_syntax::dump::dump(&tree));
     ExitCode::SUCCESS
 }

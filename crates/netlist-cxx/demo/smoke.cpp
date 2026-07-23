@@ -71,7 +71,7 @@ int main(int argc, char **argv) {
   ss << in.rdbuf();
   std::string source = ss.str();
 
-  netlist::Netlist nl = netlist::parse_spectre_netlist(rust::Str(source));
+  netlist::Netlist nl = netlist::parse_netlist(rust::Str(source), rust::Str("spectre"));
 
   std::cout << "=== global parameters ===\n";
   print_params(nl.params, "  ");
