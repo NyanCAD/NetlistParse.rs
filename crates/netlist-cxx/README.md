@@ -12,7 +12,7 @@ management:
 ```cpp
 #include "netlist_cxx/netlist.h"
 
-netlist::Netlist nl = netlist::parse_spectre_netlist(rust::Str(source));
+netlist::Netlist nl = netlist::parse_netlist(rust::Str(source), rust::Str("spectre"));
 for (const auto &inst : nl.instances)
     std::cout << std::string(inst.name) << " -> " << std::string(inst.master) << "\n";
 ```
