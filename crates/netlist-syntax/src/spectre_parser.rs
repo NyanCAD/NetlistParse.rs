@@ -102,8 +102,14 @@ impl<'a> Parser<'a> {
             raw,
             p: 0,
             started: false,
-            nt: Sig { idx: 0, kind: ERROR },
-            nnt: Sig { idx: 0, kind: ERROR },
+            nt: Sig {
+                idx: 0,
+                kind: ERROR,
+            },
+            nnt: Sig {
+                idx: 0,
+                kind: ERROR,
+            },
             emit_idx: 0,
             builder: GreenNodeBuilder::new(),
             errored: false,
@@ -148,13 +154,8 @@ impl<'a> Parser<'a> {
     /// until the dialect switches back, then resync the Spectre cursor.
     fn handoff_to_spice(&mut self, start_byte: u32) {
         let builder = std::mem::replace(&mut self.builder, GreenNodeBuilder::new());
-        let (builder, stop, errored) = crate::parser::parse_spice_region(
-            self.src,
-            self.dialect,
-            builder,
-            start_byte,
-            true,
-        );
+        let (builder, stop, errored) =
+            crate::parser::parse_spice_region(self.src, self.dialect, builder, start_byte, true);
         self.builder = builder;
         self.errored |= errored;
         self.resync_at(stop);

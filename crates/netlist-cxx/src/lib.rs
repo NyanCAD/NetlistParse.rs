@@ -936,9 +936,18 @@ fn lang_error_netlist() -> ffi::Netlist {
 
 fn empty_netlist() -> ffi::Netlist {
     ffi::Netlist {
-        params: vec![], models: vec![], subckts: vec![], instances: vec![],
-        analyses: vec![], saves: vec![], ics: vec![], globals: vec![],
-        includes: vec![], ahdl_includes: vec![], errors: vec![], spice_blocks: vec![],
+        params: vec![],
+        models: vec![],
+        subckts: vec![],
+        instances: vec![],
+        analyses: vec![],
+        saves: vec![],
+        ics: vec![],
+        globals: vec![],
+        includes: vec![],
+        ahdl_includes: vec![],
+        errors: vec![],
+        spice_blocks: vec![],
     }
 }
 
@@ -955,10 +964,18 @@ pub fn parse_netlist(src: &str, language: &str) -> ffi::Netlist {
     let source = sast::SpectreNetlistSource::cast(root).expect("root is SpectreNetlistSource");
     let scope = collect_scope(source.statements());
     ffi::Netlist {
-        params: scope.params, models: scope.models, subckts: scope.subckts,
-        instances: scope.instances, analyses: scope.analyses, saves: scope.saves,
-        ics: scope.ics, globals: scope.globals, includes: scope.includes,
-        ahdl_includes: scope.ahdl_includes, errors, spice_blocks: scope.spice_blocks,
+        params: scope.params,
+        models: scope.models,
+        subckts: scope.subckts,
+        instances: scope.instances,
+        analyses: scope.analyses,
+        saves: scope.saves,
+        ics: scope.ics,
+        globals: scope.globals,
+        includes: scope.includes,
+        ahdl_includes: scope.ahdl_includes,
+        errors,
+        spice_blocks: scope.spice_blocks,
     }
 }
 
@@ -974,7 +991,11 @@ pub fn parse_netlist_lib(src: &str, section: &str, language: &str) -> ffi::Netli
     let errors = collect_errors(&root);
 
     let mut block = ffi::SpiceBlock {
-        params: vec![], models: vec![], subckts: vec![], devices: vec![], includes: vec![],
+        params: vec![],
+        models: vec![],
+        subckts: vec![],
+        devices: vec![],
+        includes: vec![],
     };
     for child in root.children() {
         if child.kind() == SyntaxKind::LibStatement {
@@ -1353,7 +1374,11 @@ mod tests {
     #[test]
     fn parse_netlist_ngspice_projects_spice_block() {
         let nl = super::parse_netlist("* t\nR1 a b 1k\n", "ngspice");
-        assert!(nl.errors.is_empty(), "unexpected errors: {}", nl.errors.len());
+        assert!(
+            nl.errors.is_empty(),
+            "unexpected errors: {}",
+            nl.errors.len()
+        );
         assert_eq!(nl.spice_blocks.len(), 1);
         assert_eq!(nl.spice_blocks[0].devices.len(), 1);
     }
