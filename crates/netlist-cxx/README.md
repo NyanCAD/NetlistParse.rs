@@ -62,4 +62,40 @@ g++ -std=c++20 -Igen consumer.cpp gen/netlist_cxx/shim.cc \
 cmake -S crates/netlist-cxx/demo -B build
 cmake --build build
 ./build/smoke crates/netlist-cxx/demo/example.scs
+ctest --test-dir build --output-on-failure
 ```
+
+## SPICE scopes and conditionals
+
+SPICE regions are returned in `Netlist.spice_blocks`. Both `SpiceBlock` and
+`SpiceSubckt` carry `includes` and `conditionals` alongside their existing
+device, model, parameter, and subcircuit collections.
+
+Each `SpiceConditional` contains ordered `SpiceCondClause` values:
+
+- `condition` is the expression text for `.if` or `.elseif`, without the
+  directive's surrounding parentheses. An empty string denotes `.else`.
+- `body` is a `SpiceBlock` containing that clause's statements, including
+  further conditionals, local model/parameter definitions, and includes.
+
+For example, devices inside `.if (rfmode == 0)` stay in that clause's body;
+they do not appear in the enclosing subcircuit's unconditional `devices`.
+Conditions are not evaluated during parsing, even when constant. The consumer
+selects branches using the eventual instance parameters.
+
+Subcircuit-local `.include` and `.lib` directives retain their path and optional
+section in that subcircuit's `includes`. The parser does not read included files
+or deduplicate references across scopes. The consumer must resolve each include
+relative to its source file and in its defining scope. As with the existing
+projection, statements are grouped by kind; order is preserved within each
+collection, not across different statement kinds.
+
+Consumers must process these collections recursively, or reject constructs they
+cannot support; ignoring them can turn a valid device wrapper into an empty
+subcircuit. Preserving OSDI instances in the bridge does not implement their
+electrical behavior in a simulator.
+
+This extends the shared C++ struct layouts. Regenerate the header/shim and
+rebuild consumers together with the Rust library; do not mix old generated
+headers with a new static library. The `spice_scopes` CTest exercises the new
+recursive data through the generated C++ interface.

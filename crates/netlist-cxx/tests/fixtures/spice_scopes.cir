@@ -1,0 +1,29 @@
+* Reduced IHP-style wrapper: includes and conditional devices must stay scoped.
+.subckt probe d g s b rfmode=0 ng=1 m=1
+.param width=0.15u
+.include "shared models.lib"
+.lib "corners.lib" tt
+.if (rfmode == 0)
+  .param branch_scale=ng*2
+  .model local_psp psp103va type=1
+  .include "normal.inc"
+  .if (ng == 1)
+    N1 d g s b local_psp nf=ng mult=m
+    R1 d s 1k
+  .elseif (ng == 2)
+    N1 d g s b local_psp nf=2 mult=m
+  .else
+    N1 d g s b local_psp nf=ng mult=m
+  .endif
+.else
+  .lib "corners.lib" rf
+  .subckt rf_helper d g s b
+    .include "shared models.lib"
+    Nrf d g s b rf_psp nf=1
+  .ends rf_helper
+  Xrf d g s b rf_helper
+.endif
+.ends probe
+.subckt sibling d g s b
+.include "shared models.lib"
+.ends sibling
