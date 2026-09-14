@@ -166,16 +166,31 @@ mod ffi {
         devices: Vec<SpiceDevice>,
         models: Vec<SpiceModel>,
         subckts: Vec<SpiceSubckt>,
+        includes: Vec<Include>,
+        conditionals: Vec<SpiceConditional>,
     }
 
-    /// One contiguous SPICE block (everything between two `simulator lang=`
-    /// switches, or the whole file when starting in SPICE).
+    /// One `.if`/`.elseif`/`.else` clause. An empty condition denotes `.else`;
+    /// other conditions are unevaluated expression source text.
+    struct SpiceCondClause {
+        condition: String,
+        body: SpiceBlock,
+    }
+
+    /// A SPICE conditional block, with clauses in source order.
+    struct SpiceConditional {
+        clauses: Vec<SpiceCondClause>,
+    }
+
+    /// SPICE statements grouped by kind within one scope: a contiguous SPICE
+    /// region, a subcircuit body, a library section, or a conditional clause.
     struct SpiceBlock {
         params: Vec<Param>,
         models: Vec<SpiceModel>,
         subckts: Vec<SpiceSubckt>,
         devices: Vec<SpiceDevice>,
         includes: Vec<Include>,
+        conditionals: Vec<SpiceConditional>,
     }
 
     /// The whole netlist, projected into grouped value structs.
@@ -688,57 +703,48 @@ fn project_spice_model(m: &ast::Model) -> ffi::SpiceModel {
     }
 }
 
-/// Project a SPICE `.subckt` definition into a `SpiceSubckt`, recursively
-/// walking the body for nested devices, `.model` cards, and `.subckt` definitions.
+/// Preserve each branch as its own scope. Conditions depend on the eventual
+/// instance parameters, so projecting must neither evaluate nor flatten them.
+fn project_spice_conditional(c: &ast::IfBlock) -> ffi::SpiceConditional {
+    ffi::SpiceConditional {
+        clauses: c
+            .cases()
+            .map(|clause| ffi::SpiceCondClause {
+                condition: clause
+                    .condition()
+                    .and_then(|condition| condition.expr())
+                    .map(|expr| expr.text().trim().to_string())
+                    .unwrap_or_default(),
+                body: project_spice_block_children(clause.body()),
+            })
+            .collect(),
+    }
+}
+
+/// Project a SPICE `.subckt` without moving branch bodies or includes out of
+/// their defining scope. Include resolution is the consumer's responsibility.
 fn project_spice_subckt(s: &ast::Subckt) -> ffi::SpiceSubckt {
-    // NOTE: SpiceSubckt has no `includes` field; .include/.lib inside a .subckt body are
-    // not projected (top-level includes only, matching the C++ include-resolution scope).
-    let mut devices = vec![];
-    let mut models = vec![];
-    let mut subckts = vec![];
+    let body = project_spice_block_children(s.body());
     // Formal params from the `.subckt` header (e.g. `w=1 l=1`). Internal
     // `.param` statements from the body are appended below, after the formal
     // params, so downstream sees them in source order (body params may depend
     // on the formal ones).
     let mut params: Vec<ffi::Param> = s.params().map(|p| project_spice_param(&p)).collect();
-    for child in s.body() {
-        match child.kind() {
-            SyntaxKind::Model => {
-                if let Some(m) = ast::Model::cast(child) {
-                    models.push(project_spice_model(&m));
-                }
-            }
-            SyntaxKind::Subckt => {
-                if let Some(sub) = ast::Subckt::cast(child) {
-                    subckts.push(project_spice_subckt(&sub));
-                }
-            }
-            SyntaxKind::ParamStatement => {
-                if let Some(ps) = ast::ParamStatement::cast(child) {
-                    for p in ps.params() {
-                        params.push(project_spice_param(&p));
-                    }
-                }
-            }
-            _ => {
-                if let Some(dev) = project_spice_device(child) {
-                    devices.push(dev);
-                }
-            }
-        }
-    }
+    params.extend(body.params);
     ffi::SpiceSubckt {
         name: tok_text(s.name()),
         ports: s.ports().map(|p| p.text()).collect(),
         params,
-        devices,
-        models,
-        subckts,
+        devices: body.devices,
+        models: body.models,
+        subckts: body.subckts,
+        includes: body.includes,
+        conditionals: body.conditionals,
     }
 }
 
 /// Project an iterator of SPICE children (params, models, subckts, devices,
-/// includes) into a `SpiceBlock`.
+/// includes, conditionals) into a `SpiceBlock`.
 fn project_spice_block_children(children: impl Iterator<Item = SyntaxNode>) -> ffi::SpiceBlock {
     let mut block = ffi::SpiceBlock {
         params: vec![],
@@ -746,6 +752,7 @@ fn project_spice_block_children(children: impl Iterator<Item = SyntaxNode>) -> f
         subckts: vec![],
         devices: vec![],
         includes: vec![],
+        conditionals: vec![],
     };
     for child in children {
         match child.kind() {
@@ -780,6 +787,13 @@ fn project_spice_block_children(children: impl Iterator<Item = SyntaxNode>) -> f
                         path: unquote(&tok_text(lib.path())),
                         section: tok_text(lib.section()),
                     });
+                }
+            }
+            SyntaxKind::IfBlock => {
+                if let Some(conditional) = ast::IfBlock::cast(child) {
+                    block
+                        .conditionals
+                        .push(project_spice_conditional(&conditional));
                 }
             }
             _ => {
@@ -996,6 +1010,7 @@ pub fn parse_netlist_lib(src: &str, section: &str, language: &str) -> ffi::Netli
         subckts: vec![],
         devices: vec![],
         includes: vec![],
+        conditionals: vec![],
     };
     for child in root.children() {
         if child.kind() == SyntaxKind::LibStatement {
@@ -1008,6 +1023,7 @@ pub fn parse_netlist_lib(src: &str, section: &str, language: &str) -> ffi::Netli
                     block.subckts.extend(inner.subckts);
                     block.devices.extend(inner.devices);
                     block.includes.extend(inner.includes);
+                    block.conditionals.extend(inner.conditionals);
                 }
             }
         }
@@ -1022,6 +1038,132 @@ pub fn parse_netlist_lib(src: &str, section: &str, language: &str) -> ffi::Netli
 #[cfg(test)]
 mod tests {
     use super::{parse_netlist, parse_netlist_lib};
+
+    #[test]
+    fn projects_spice_scoped_includes_and_nested_conditionals() {
+        let src = include_str!("../tests/fixtures/spice_scopes.cir");
+        let nl = parse_netlist(src, "ngspice");
+        assert!(nl.errors.is_empty());
+        let top = &nl.spice_blocks[0];
+        assert!(top.devices.is_empty());
+        assert!(top.models.is_empty());
+        assert!(top.includes.is_empty());
+        assert!(top.conditionals.is_empty());
+        assert_eq!(top.subckts.len(), 2);
+
+        let sub = &top.subckts[0];
+        assert_eq!(sub.name, "probe");
+        assert_eq!(sub.ports, ["d", "g", "s", "b"]);
+        assert_eq!(
+            sub.params
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["rfmode", "ng", "m", "width"]
+        );
+        assert!(
+            sub.devices.is_empty(),
+            "conditional devices must not be flattened"
+        );
+        assert!(sub.models.is_empty(), "conditional models must not leak");
+        assert!(
+            sub.subckts.is_empty(),
+            "conditional definitions must not leak"
+        );
+        assert_eq!(sub.includes.len(), 2);
+        assert_eq!(sub.includes[0].path, "shared models.lib");
+        assert_eq!(sub.includes[0].section, "");
+        assert_eq!(sub.includes[1].path, "corners.lib");
+        assert_eq!(sub.includes[1].section, "tt");
+        // A repeated reference is meaningful in each subcircuit scope.
+        assert_eq!(top.subckts[1].includes.len(), 1);
+        assert_eq!(top.subckts[1].includes[0].path, "shared models.lib");
+
+        assert_eq!(sub.conditionals.len(), 1);
+        let clauses = &sub.conditionals[0].clauses;
+        assert_eq!(clauses.len(), 2);
+        assert_eq!(clauses[0].condition, "rfmode == 0");
+        assert_eq!(clauses[1].condition, "");
+        let normal = &clauses[0].body;
+        assert_eq!(normal.params.len(), 1);
+        assert_eq!(normal.params[0].name, "branch_scale");
+        assert_eq!(normal.params[0].value, "ng*2");
+        assert_eq!(normal.models.len(), 1);
+        assert_eq!(normal.models[0].name, "local_psp");
+        assert_eq!(normal.models[0].model_type, "psp103va");
+        assert_eq!(normal.includes.len(), 1);
+        assert_eq!(normal.includes[0].path, "normal.inc");
+        assert!(normal.devices.is_empty());
+        assert_eq!(normal.conditionals.len(), 1);
+        let nested = &normal.conditionals[0].clauses;
+        assert_eq!(nested.len(), 3);
+        assert_eq!(nested[0].condition, "ng == 1");
+        assert_eq!(nested[1].condition, "ng == 2");
+        assert_eq!(nested[2].condition, "");
+        assert_eq!(nested[0].body.devices.len(), 2);
+        assert_eq!(
+            nested[0].body.devices[0].kind,
+            super::ffi::SpiceDeviceKind::Osdi
+        );
+        assert_eq!(nested[0].body.devices[0].nodes, ["d", "g", "s", "b"]);
+        assert_eq!(nested[0].body.devices[0].model, "local_psp");
+        assert_eq!(nested[0].body.devices[0].params[0].value, "ng");
+        assert_eq!(nested[0].body.devices[0].params[1].value, "m");
+        assert_eq!(nested[0].body.devices[1].name, "R1");
+        assert_eq!(nested[1].body.devices.len(), 1);
+        assert_eq!(nested[1].body.devices[0].params[0].value, "2");
+        assert_eq!(nested[2].body.devices.len(), 1);
+
+        let rf = &clauses[1].body;
+        assert_eq!(rf.includes.len(), 1);
+        assert_eq!(rf.includes[0].section, "rf");
+        assert_eq!(rf.subckts.len(), 1);
+        assert_eq!(rf.subckts[0].name, "rf_helper");
+        assert_eq!(rf.subckts[0].includes[0].path, "shared models.lib");
+        assert_eq!(rf.subckts[0].devices[0].name, "Nrf");
+        assert_eq!(rf.devices.len(), 1);
+        assert_eq!(rf.devices[0].model, "rf_helper");
+    }
+
+    #[test]
+    fn projects_spice_conditionals_in_top_level_and_library_sections() {
+        let body = ".if (1)\nR1 a b 1k\n.endif\n\
+                    .if (gain > 2)\n.include \"high.inc\"\n\
+                    .else\n.lib \"low.lib\" tt\n.endif\n";
+        let source = format!("* t\n{body}");
+        let library = format!(
+            "* t\n.lib tt\n{body}.endl tt\n\
+                               .lib ff\n.if (0)\nRff a b 2k\n.endif\n.endl ff\n"
+        );
+        for dialect in ["ngspice", "xyce"] {
+            for nl in [
+                parse_netlist(&source, dialect),
+                parse_netlist_lib(&library, "tt", dialect),
+            ] {
+                assert!(nl.errors.is_empty());
+                let block = &nl.spice_blocks[0];
+                assert!(block.devices.is_empty());
+                assert!(block.includes.is_empty());
+                assert_eq!(block.conditionals.len(), 2);
+                let first = &block.conditionals[0].clauses;
+                assert_eq!(first.len(), 1);
+                assert_eq!(first[0].condition, "1");
+                assert_eq!(first[0].body.devices.len(), 1);
+                assert_eq!(first[0].body.devices[0].name, "R1");
+                let second = &block.conditionals[1].clauses;
+                assert_eq!(second.len(), 2);
+                assert_eq!(second[0].condition, "gain > 2");
+                assert_eq!(second[0].body.includes[0].path, "high.inc");
+                assert_eq!(second[1].condition, "");
+                assert_eq!(second[1].body.includes[0].section, "tt");
+            }
+            let ff = parse_netlist_lib(&library, "ff", dialect);
+            let clause = &ff.spice_blocks[0].conditionals[0].clauses[0];
+            // False branches are retained for the consumer, not evaluated here.
+            assert_eq!(clause.condition, "0");
+            assert_eq!(clause.body.devices[0].name, "Rff");
+        }
+    }
 
     #[test]
     fn projects_top_level() {

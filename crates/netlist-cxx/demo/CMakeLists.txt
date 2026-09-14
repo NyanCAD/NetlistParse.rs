@@ -69,3 +69,11 @@ add_executable(smoke "${CMAKE_CURRENT_SOURCE_DIR}/smoke.cpp" "${GEN_SHIM}")
 add_dependencies(smoke rust_netlist_cxx)
 target_include_directories(smoke PRIVATE "${GEN_DIR}")
 target_link_libraries(smoke PRIVATE "${RUST_LIB}" pthread dl m)
+
+enable_testing()
+add_executable(spice_scopes "${CMAKE_CURRENT_SOURCE_DIR}/spice_scopes.cpp" "${GEN_SHIM}")
+add_dependencies(spice_scopes rust_netlist_cxx)
+target_include_directories(spice_scopes PRIVATE "${GEN_DIR}")
+target_link_libraries(spice_scopes PRIVATE "${RUST_LIB}" pthread dl m)
+add_test(NAME spice_scopes
+  COMMAND spice_scopes "${CRATE_DIR}/tests/fixtures/spice_scopes.cir")

@@ -29,6 +29,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
+  cxx:
+    name: C++ bridge
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Cargo.lock is not tracked; match this checkout's resolved cxx version.
+      - name: Install matching C++ generator
+        run: |
+          CXX_VERSION=$(cargo metadata --format-version 1 | python3 -c 'import json, sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "cxx"))')
+          cargo install cxxbridge-cmd --version "=$CXX_VERSION" --locked
+      - run: cmake -S crates/netlist-cxx/demo -B target/cxx-smoke
+      - run: cmake --build target/cxx-smoke
+      - run: ctest --test-dir target/cxx-smoke --output-on-failure
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
