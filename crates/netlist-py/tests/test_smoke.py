@@ -47,3 +47,24 @@ def test_errors():
     assert len(errs) == 1, f"expected 1 error, got {len(errs)}: {errs}"
     start, end = errs[0]
     assert end - start == 1, f"expected error span width 1, got {end - start}: ({start}, {end})"
+
+
+def test_parse_spectre():
+    src = "parameters r=1k\nmodel rm resistor r=r\nr1 (a 0) rm\n"
+    root = netlist_parser.parse_spectre(src)
+    assert root.kind == "SpectreNetlistSource"
+    assert root.text == src
+    assert netlist_parser.errors(root) == []
+    assert find_child(root, "Model") is not None
+    assert find_child(root, "Instance") is not None
+
+
+def test_vacask_extensions_are_opt_in():
+    src = 'load "resistor.osdi"\nsection tt\nmodel rm resistor (r=1k)\nendsection\n'
+    native = netlist_parser.parse_spectre(src)
+    assert netlist_parser.errors(native)
+    root = netlist_parser.parse_spectre(src, vacask=True)
+    assert root.text == src
+    assert netlist_parser.errors(root) == []
+    assert find_child(root, "HDLStatement") is not None
+    assert find_child(root, "LibStatement") is not None

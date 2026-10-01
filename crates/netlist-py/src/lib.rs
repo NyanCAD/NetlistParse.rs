@@ -1,8 +1,9 @@
-//! PyO3 Python bindings for the `netlist-syntax` SPICE parser.
+//! PyO3 Python bindings for the `netlist-syntax` SPICE and Spectre parsers.
 //!
 //! Exposes a single `#[pyclass] Node` that wraps any rowan element (node or
-//! token), and two module-level functions:
+//! token), and module-level functions:
 //!   - `parse_spice(src: str) -> Node`  — parse and return the CST root.
+//!   - `parse_spectre(src: str, *, vacask=False) -> Node` — Spectre/native library CST.
 //!   - `errors(root: Node) -> list[tuple[int,int]]` — collect Error-token spans.
 
 use netlist_syntax::syntax_kind::{SyntaxElement, SyntaxKind};
@@ -113,6 +114,20 @@ fn parse_spice_py(src: &str) -> Node {
     }
 }
 
+/// Parse Spectre source; with `vacask=True`, accept native VACASK library extensions.
+#[pyfunction]
+#[pyo3(signature = (src, *, vacask=false))]
+fn parse_spectre(src: &str, vacask: bool) -> Node {
+    let root = if vacask {
+        netlist_syntax::spectre_parser::parse_vacask(src)
+    } else {
+        netlist_syntax::parse_spectre(src)
+    };
+    Node {
+        inner: NodeOrToken::Node(root),
+    }
+}
+
 /// Walk a CST root and return all `Error`-token spans as `(start, end)` tuples.
 #[pyfunction]
 fn errors(root: &Node) -> Vec<(u32, u32)> {
@@ -124,6 +139,7 @@ fn errors(root: &Node) -> Vec<(u32, u32)> {
 #[pymodule]
 fn netlist_parser(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parse_spice_py, m)?)?;
+    m.add_function(wrap_pyfunction!(parse_spectre, m)?)?;
     m.add_function(wrap_pyfunction!(errors, m)?)?;
     m.add_class::<Node>()?;
     Ok(())
