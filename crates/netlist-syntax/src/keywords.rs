@@ -43,6 +43,12 @@ const KEYWORDS: &[(&str, TokenKind)] = &[
     ("ENDL", ENDL),
     ("ENDS", ENDS),
     ("PARAMETERS", PARAMETERS),
+    // Branching the trie at "PARAM" (below) breaks its unique-prefix
+    // completion to PARAMETERS, so "PARAM" must become its own explicit key.
+    ("PARAM", PARAMETERS),
+    // HSPICE-style alias accepted alongside `.param`; IHP's native ngspice
+    // libraries (e.g. diodes.lib) use `.params` for grouped parameter blocks.
+    ("PARAMS", PARAMETERS),
     ("CSPARAM", CSPARAM),
     ("OPTIONS", OPTIONS),
     ("TEMP", TEMP),

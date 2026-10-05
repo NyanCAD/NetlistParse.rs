@@ -88,7 +88,6 @@ pub struct Parser<'a> {
     /// SPICE dialect used for any SPICE region (leading `.cir` region or a
     /// mid-file `simulator lang=spice` handoff).
     dialect: Dialect,
-    vacask: bool,
 }
 
 fn to_raw(kind: SyntaxKind) -> rowan::SyntaxKind {
@@ -117,7 +116,6 @@ impl<'a> Parser<'a> {
             lang_swapped: false,
             dry: false,
             dialect,
-            vacask: false,
         };
         p.nt = p.next_sig();
         p.nnt = p.next_sig();
@@ -524,26 +522,6 @@ impl<'a> Parser<'a> {
 
     /// `parse_spectrenetlist_source`.
     fn parse_source(&mut self) -> PResult {
-        if self.vacask {
-            let text = self.token_text();
-            if text == "load" {
-                return self.parse_vacask_load();
-            }
-            if self.nt.kind == SECTION {
-                return self.parse_vacask_section();
-            }
-            if self.nt.kind == AT_SIGN {
-                return self.parse_vacask_conditional();
-            }
-            if text == "ground" {
-                let cp = self.checkpoint();
-                self.take_identifier()?;
-                self.parse_nodes()?;
-                self.accept_newline()?;
-                self.wrap_at(cp, SyntaxKind::Global);
-                return Ok(());
-            }
-        }
         match self.nt.kind {
             SIMULATOR => self.parse_simulator(),
             MODEL => self.parse_model(),
@@ -571,73 +549,6 @@ impl<'a> Parser<'a> {
             }
             _ => self.error(),
         }
-    }
-
-    fn token_text(&self) -> &str {
-        let t = self.raw[self.nt.idx];
-        &self.src[t.start as usize..t.end as usize]
-    }
-
-    fn parse_vacask_load(&mut self) -> PResult {
-        let cp = self.checkpoint();
-        self.wrapped(cp, SyntaxKind::HDLStatement, |p| {
-            p.take_identifier()?;
-            p.take_string()?;
-            p.accept_newline()
-        })
-    }
-
-    fn parse_vacask_section(&mut self) -> PResult {
-        let cp = self.checkpoint();
-        self.wrapped(cp, SyntaxKind::LibStatement, |p| {
-            p.take_kw(&[SECTION])?;
-            p.take_identifier()?;
-            p.accept_newline()?;
-            while p.token_text() != "endsection" && p.nt.kind != ENDMARKER {
-                p.parse_source()?;
-            }
-            if p.nt.kind == ENDMARKER {
-                return p.error();
-            }
-            p.take_identifier()?;
-            p.accept_newline()
-        })
-    }
-
-    fn parse_vacask_conditional(&mut self) -> PResult {
-        let cp = self.checkpoint();
-        self.wrapped(cp, SyntaxKind::IfBlock, |p| loop {
-            let case = p.checkpoint();
-            p.take(&[AT_SIGN])?;
-            let is_else = p.nt.kind == ELSE;
-            if is_else {
-                p.take_kw(&[ELSE])?;
-            } else {
-                p.take_kw(&[IF])?;
-                let cond = p.checkpoint();
-                p.parse_expression()?;
-                p.wrap_at(cond, SyntaxKind::Condition);
-            }
-            p.accept_newline()?;
-            while p.nt.kind != ENDMARKER {
-                if p.nt.kind == AT_SIGN && matches!(p.nnt.kind, ELSE | END) {
-                    break;
-                }
-                p.parse_source()?;
-            }
-            p.wrap_at(case, SyntaxKind::IfElseCase);
-            if p.nt.kind == ENDMARKER {
-                return p.error();
-            }
-            if p.nnt.kind == END {
-                p.take(&[AT_SIGN])?;
-                p.take_kw(&[END])?;
-                return p.accept_newline();
-            }
-            if is_else {
-                return p.error();
-            }
-        })
     }
 
     // --- simulator / language ---
@@ -686,23 +597,8 @@ impl<'a> Parser<'a> {
     fn parse_parameter_list(&mut self) -> PResult {
         let cp = self.checkpoint();
         self.wrapped_on_err(cp, |p| {
-            let grouped = p.vacask && p.nt.kind == LPAREN;
-            if grouped {
-                p.take(&[LPAREN])?;
-            }
-            while if grouped {
-                p.nt.kind != RPAREN && p.nt.kind != ENDMARKER
-            } else {
-                !p.eol()
-            } {
-                if grouped && p.nt.kind == NEWLINE {
-                    p.accept_newline()?;
-                } else {
-                    p.parse_parameter()?;
-                }
-            }
-            if grouped {
-                p.take(&[RPAREN])?;
+            while !p.eol() {
+                p.parse_parameter()?;
             }
             Ok(())
         })
@@ -711,14 +607,7 @@ impl<'a> Parser<'a> {
     fn parse_parameter(&mut self) -> PResult {
         let cp = self.checkpoint();
         self.wrapped(cp, SyntaxKind::Parameter, |p| {
-            if p.vacask && p.nt.kind == DOLLAR {
-                let name = p.checkpoint();
-                p.take(&[DOLLAR])?;
-                p.take_identifier()?;
-                p.wrap_at(name, SyntaxKind::Identifier);
-            } else {
-                p.take_identifier()?;
-            }
+            p.take_identifier()?; // name (lenient)
             p.accept(&[EQ])?;
             p.parse_expression()
         })
@@ -1215,16 +1104,14 @@ impl<'a> Parser<'a> {
     fn parse_expression(&mut self) -> PResult {
         let cp = self.checkpoint();
         self.parse_primary_or_unary()?;
-        let binary = self.nt.kind.is_operator();
-        if binary {
+        if self.nt.kind.is_operator() {
             let op = self.nt.kind;
             self.bump(SyntaxKind::Operator);
             if self.parse_binop(cp, op, None).is_err() {
                 self.wrap_at(cp, SyntaxKind::Incomplete);
                 return Err(());
             }
-        }
-        if (!binary || self.vacask) && self.nt.kind == CONDITIONAL {
+        } else if self.nt.kind == CONDITIONAL {
             return self.wrapped(cp, SyntaxKind::TernaryExpr, |p| {
                 p.take(&[CONDITIONAL])?;
                 p.parse_expression()?; // ifcase
@@ -1299,13 +1186,6 @@ impl<'a> Parser<'a> {
 
     fn parse_primary(&mut self) -> PResult {
         let k = self.nt.kind;
-        if self.vacask && k == DOLLAR {
-            let cp = self.checkpoint();
-            self.take(&[DOLLAR])?;
-            self.take_identifier()?;
-            self.wrap_at(cp, SyntaxKind::NameRef);
-            return Ok(());
-        }
         // number / literal (string counts as `Literal`): bare terminal.
         if k.is_number() || k.is_literal() {
             return self.take_literal();
@@ -1406,14 +1286,5 @@ pub fn parse(src: &str) -> SyntaxNode {
 pub fn parse_with(src: &str, start_lang: StartLang, dialect: Dialect) -> SyntaxNode {
     let mut p = Parser::new(src, dialect);
     p.parse_toplevel(start_lang);
-    SyntaxNode::new_root(p.builder.finish())
-}
-
-/// Parse native VACASK model libraries. Simulation control commands remain outside this API.
-/// Existing Spectre parsing retains its original grammar and CST contract.
-pub fn parse_vacask(src: &str) -> SyntaxNode {
-    let mut p = Parser::new(src, Dialect::Ngspice);
-    p.vacask = true;
-    p.parse_toplevel(StartLang::Spectre);
     SyntaxNode::new_root(p.builder.finish())
 }

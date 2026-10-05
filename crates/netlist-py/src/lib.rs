@@ -2,11 +2,15 @@
 //!
 //! Exposes a single `#[pyclass] Node` that wraps any rowan element (node or
 //! token), and module-level functions:
-//!   - `parse_spice(src: str) -> Node`  — parse and return the CST root.
-//!   - `parse_spectre(src: str, *, vacask=False) -> Node` — Spectre/native library CST.
+//!   - `parse_spice(src: str) -> Node`  — parse and return the CST root (ngspice dialect).
+//!   - `parse_netlist(src: str, language: str = "ngspice") -> Node` — dialect-aware
+//!     entry point mirroring `netlist-cxx::parse_netlist`. Accepted: "ngspice" |
+//!     "hspice" | "pspice" | "xyce" | "spectre".
 //!   - `errors(root: Node) -> list[tuple[int,int]]` — collect Error-token spans.
 
 use netlist_syntax::syntax_kind::{SyntaxElement, SyntaxKind};
+use netlist_syntax::{parse_spectre_with, Dialect, StartLang};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rowan::NodeOrToken;
 
@@ -114,18 +118,25 @@ fn parse_spice_py(src: &str) -> Node {
     }
 }
 
-/// Parse Spectre source; with `vacask=True`, accept native VACASK library extensions.
+/// Parse a netlist in an explicit dialect. Mirrors `netlist-cxx::parse_netlist`.
+/// Accepted: "ngspice" | "hspice" | "pspice" | "xyce" | "spectre".
 #[pyfunction]
-#[pyo3(signature = (src, *, vacask=false))]
-fn parse_spectre(src: &str, vacask: bool) -> Node {
-    let root = if vacask {
-        netlist_syntax::spectre_parser::parse_vacask(src)
-    } else {
-        netlist_syntax::parse_spectre(src)
+#[pyo3(name = "parse_netlist", signature = (src, language="ngspice"))]
+fn parse_netlist_py(src: &str, language: &str) -> PyResult<Node> {
+    let (start_lang, dialect) = match language.to_ascii_lowercase().as_str() {
+        "ngspice" => (StartLang::Spice, Dialect::Ngspice),
+        "hspice" => (StartLang::Spice, Dialect::Hspice),
+        "pspice" => (StartLang::Spice, Dialect::Pspice),
+        "xyce" => (StartLang::Spice, Dialect::Xyce),
+        // Dialect is only consulted if a `simulator lang=spice` region
+        // appears; Ngspice is the harmless default there.
+        "spectre" => (StartLang::Spectre, Dialect::Ngspice),
+        other => return Err(PyValueError::new_err(format!("unknown dialect: {other}"))),
     };
-    Node {
+    let root = parse_spectre_with(src, start_lang, dialect);
+    Ok(Node {
         inner: NodeOrToken::Node(root),
-    }
+    })
 }
 
 /// Walk a CST root and return all `Error`-token spans as `(start, end)` tuples.
@@ -139,7 +150,7 @@ fn errors(root: &Node) -> Vec<(u32, u32)> {
 #[pymodule]
 fn netlist_parser(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parse_spice_py, m)?)?;
-    m.add_function(wrap_pyfunction!(parse_spectre, m)?)?;
+    m.add_function(wrap_pyfunction!(parse_netlist_py, m)?)?;
     m.add_function(wrap_pyfunction!(errors, m)?)?;
     m.add_class::<Node>()?;
     Ok(())
