@@ -47,7 +47,7 @@ void print_subckt(const netlist::Subckt &s, const std::string &indent) {
     for (const auto &cl : cond.clauses) {
       std::cout << indent << "    "
                 << (cl.condition.size() ? str(cl.condition) : std::string("else"))
-                << " => " << str(cl.instance.name) << "\n";
+                << " => " << cl.body.instances.size() << " instance(s)\n";
     }
   }
   for (const auto &nested : s.subckts) {

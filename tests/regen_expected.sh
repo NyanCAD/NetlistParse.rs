@@ -3,6 +3,11 @@
 # differential test). Requires a Julia environment with the local
 # NyanSpectreNetlistParser dev-added. Set JULIA_ENV to that project dir.
 #
+# This script covers only the SPICE corpus (`tests/corpus/*.sp`). The Spectre
+# expected dumps for constructs the Rust port now leads on are regenerated with
+# `tests/regen_expected_spectre.sh` (Rust-first); the rest remain Julia ground
+# truth.
+#
 #   JULIA_ENV=/path/to/env ./tests/regen_expected.sh
 #
 # To create such an env:

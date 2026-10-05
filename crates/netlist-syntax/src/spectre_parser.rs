@@ -477,6 +477,44 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Consume a newline as `Notation` when present; otherwise leave the cursor
+    /// untouched. Unlike `accept_newline` this never enters error recovery, so
+    /// it is safe before an optional token (e.g. the `{` of a next-line block).
+    fn accept_newline_opt(&mut self) {
+        if self.nt.kind == NEWLINE {
+            self.bump(SyntaxKind::Notation);
+        } else if self.nt.kind == ENDMARKER {
+            self.flush_trivia(self.nt.idx); // zero-width nl at EOF
+        }
+    }
+
+    /// Consume a brace-delimited body: `{ [nl] item* }`. `item` is the
+    /// per-statement parser (`parse_source` for most blocks,
+    /// `parse_stat_statement` for a `statistics` body). Item failures recover
+    /// locally — the loop keeps scanning to the matching `}` so the tree stays
+    /// lossless and the block closes — but the body returns `Err` so the caller
+    /// can mark it `Incomplete`.
+    ///
+    /// The trailing newline is left to the caller: a conditional clause may be
+    /// followed by `} else {` on the same line, while `altergroup`/`statistics`
+    /// end the statement.
+    fn parse_brace_body(&mut self, item: fn(&mut Self) -> PResult) -> PResult {
+        self.accept(&[LBRACE])?;
+        self.accept_newline_opt();
+        let mut ok = true;
+        while self.nt.kind != RBRACE && self.nt.kind != ENDMARKER {
+            if item(self).is_err() {
+                ok = false;
+            }
+        }
+        self.accept(&[RBRACE])?;
+        if ok {
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+
     fn take_operator(&mut self) -> PResult {
         if self.nt.kind.is_operator() {
             self.bump(SyntaxKind::Operator);
@@ -841,24 +879,6 @@ impl<'a> Parser<'a> {
         self.dry = s.6;
     }
 
-    /// Emit `nt`'s text as a stand-alone `Identifier` token WITHOUT advancing
-    /// the cursor. Reproduces the Julia double-capture (`@trynext name` in
-    /// `parse_if`/`parse_elseif`/`parse_else` plus `@trynext name` inside
-    /// `parse_instance`): on the failure path the same name token is rendered
-    /// twice, inflating the tree past the source by the name's width.
-    fn emit_phantom_identifier(&mut self) {
-        self.flush_trivia(self.nt.idx); // leading trivia before the phantom
-        let t = self.raw[self.nt.idx];
-        if t.end > t.start && !self.dry {
-            self.builder.token(
-                to_raw(SyntaxKind::Identifier),
-                &self.src[t.start as usize..t.end as usize],
-            );
-        }
-        // Deliberately do NOT advance the cursor or `emit_idx`: the *real*
-        // `take_identifier` re-emits the same token next.
-    }
-
     /// `parse_analysis` — `@trysetup Analysis`: a params/newline error propagates,
     /// closing the whole node as `Incomplete`. `cp` precedes the (already-emitted)
     /// name + optional nodelist.
@@ -925,12 +945,7 @@ impl<'a> Parser<'a> {
     fn parse_altergroup(&mut self, cp: Checkpoint) -> PResult {
         self.wrapped(cp, SyntaxKind::AlterGroup, |p| {
             p.take_kw(&[ALTERGROUP])?;
-            p.accept(&[LBRACE])?;
-            p.accept_newline()?;
-            while p.nt.kind != RBRACE && p.nt.kind != ENDMARKER {
-                p.parse_source()?;
-            }
-            p.accept(&[RBRACE])?;
+            p.parse_brace_body(Self::parse_source)?;
             p.accept_newline()
         })
     }
@@ -983,12 +998,7 @@ impl<'a> Parser<'a> {
         let cp = self.checkpoint();
         self.wrapped(cp, SyntaxKind::Statistics, |p| {
             p.take_kw(&[STATISTICS])?;
-            p.accept(&[LBRACE])?;
-            p.accept_newline()?;
-            while p.nt.kind != RBRACE && p.nt.kind != ENDMARKER {
-                p.parse_stat_statement()?;
-            }
-            p.accept(&[RBRACE])?;
+            p.parse_brace_body(Self::parse_stat_statement)?;
             p.accept_newline()
         })
     }
@@ -1006,12 +1016,7 @@ impl<'a> Parser<'a> {
         let cp = self.checkpoint();
         self.wrapped(cp, SyntaxKind::StatGroup, |p| {
             p.take_identifier()?; // group name (`process`)
-            p.accept(&[LBRACE])?;
-            p.accept_newline()?;
-            while p.nt.kind != RBRACE && p.nt.kind != ENDMARKER {
-                p.parse_stat_statement()?;
-            }
-            p.accept(&[RBRACE])?;
+            p.parse_brace_body(Self::parse_stat_statement)?;
             p.accept_newline()
         })
     }
@@ -1217,9 +1222,7 @@ impl<'a> Parser<'a> {
             p.take_kw(&[IF])?;
             p.accept(&[LPAREN])?;
             p.parse_expression()?;
-            p.accept(&[RPAREN])?;
-            p.accept(&[LBRACE])?;
-            p.accept_newline() // nl1
+            p.accept(&[RPAREN])
         })(self);
         self.finish_conditional(cp, head, SyntaxKind::If)
     }
@@ -1231,25 +1234,18 @@ impl<'a> Parser<'a> {
             p.take_kw(&[IF])?; // kw2
             p.accept(&[LPAREN])?;
             p.parse_expression()?;
-            p.accept(&[RPAREN])?;
-            p.accept(&[LBRACE])?;
-            p.accept_newline()
+            p.accept(&[RPAREN])
         })(self);
         self.finish_conditional(cp, head, SyntaxKind::ElseIf)
     }
 
     /// `else {...}` — the leading `else` keyword has already been bumped at `cp`.
     fn parse_else(&mut self, cp: Checkpoint) -> PResult {
-        let head = (|p: &mut Self| -> PResult {
-            p.accept(&[LBRACE])?;
-            p.accept_newline()
-        })(self);
-        self.finish_conditional(cp, head, SyntaxKind::Else)
+        self.finish_conditional(cp, Ok(()), SyntaxKind::Else)
     }
 
     /// Shared close for `if`/`else if`/`else`: if the head already failed, wrap
-    /// `Incomplete`; otherwise parse the `name instance rbrace` body (with the
-    /// Julia double-capture quirk on failure) and wrap the form kind.
+    /// `Incomplete`; otherwise parse the clause body and wrap the form kind.
     fn finish_conditional(&mut self, cp: Checkpoint, head: PResult, form: SyntaxKind) -> PResult {
         if head.is_err() {
             self.wrap_at(cp, SyntaxKind::Incomplete);
@@ -1265,38 +1261,19 @@ impl<'a> Parser<'a> {
         tail
     }
 
-    /// The body of a conditional clause: `name = take_identifier;
-    /// parse_instance(name); rbrace`. On the failure path Julia's double-capture
-    /// duplicates the name (see `emit_phantom_identifier`), so we decide via a
-    /// dry run and prepend the phantom name only when the body fails.
+    /// The body of a conditional clause: a brace block of statements. Spectre's
+    /// structural `if` selects a whole block — instances, `include`s,
+    /// `parameters` and `assert`s all appear in the PDK — not a single instance.
+    ///
+    /// The PDK frequently writes the `{` on the line after the condition
+    /// (`if (sxcalc > 0)\n{`). The newline is consumed only when the following
+    /// significant token is `{`, so a braceless body still fails without having
+    /// emitted a stray `Notation`.
     fn parse_conditional_body(&mut self) -> PResult {
-        if self.conditional_body_ok() {
-            let icp = self.checkpoint();
-            let _ = self.take_identifier();
-            let _ = self.parse_instance(icp);
-            self.accept(&[RBRACE])
-        } else {
-            self.emit_phantom_identifier(); // captured `name` (double capture)
-            let icp = self.checkpoint();
-            let _ = self.take_identifier();
-            let _ = self.parse_instance(icp);
-            let _ = self.accept(&[RBRACE]);
-            Err(())
+        if self.nt.kind == NEWLINE && self.nnt.kind == LBRACE {
+            self.bump(SyntaxKind::Notation);
         }
-    }
-
-    /// Dry-run `name instance rbrace` to learn whether the clause body parses
-    /// cleanly (governs the double-capture rendering).
-    fn conditional_body_ok(&mut self) -> bool {
-        let saved = self.save_state();
-        self.dry = true;
-        let _ = self.take_identifier();
-        let icp = self.checkpoint();
-        let r = self
-            .parse_instance(icp)
-            .and_then(|_| self.accept(&[RBRACE]));
-        self.restore_state(saved);
-        r.is_ok()
+        self.parse_brace_body(Self::parse_source)
     }
 
     // --- expressions (precedence climbing) ---

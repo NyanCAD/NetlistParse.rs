@@ -70,14 +70,26 @@ mod ffi {
         section: String,
     }
 
-    /// One clause of a conditional instantiation. `condition` is empty for the
+    /// The grouped content of one `{ … }` body (a conditional clause body).
+    /// Mirrors `Subckt`/`SpiceBlock`: a Spectre structural `if` selects a whole
+    /// block of statements, not a single instance.
+    struct Block {
+        params: Vec<Param>,
+        models: Vec<Model>,
+        instances: Vec<Instance>,
+        subckts: Vec<Subckt>,
+        conditionals: Vec<Conditional>,
+        includes: Vec<Include>,
+    }
+
+    /// One clause of a structural conditional. `condition` is empty for the
     /// trailing `else`.
     struct CondClause {
         condition: String,
-        instance: Instance,
+        body: Block,
     }
 
-    /// A conditional-instantiation block (`if/else if/else` over instances).
+    /// A structural conditional block (`if/else if/else` over a statement block).
     struct Conditional {
         clauses: Vec<CondClause>,
     }
@@ -272,24 +284,38 @@ fn project_analysis(a: &sast::Analysis) -> ffi::Analysis {
     }
 }
 
+/// Project a clause body (an iterator of statement nodes) into a `Block`.
+fn project_block(stmts: impl Iterator<Item = SyntaxNode>) -> ffi::Block {
+    let scope = collect_scope(stmts);
+    ffi::Block {
+        params: scope.params,
+        models: scope.models,
+        instances: scope.instances,
+        subckts: scope.subckts,
+        conditionals: scope.conditionals,
+        includes: scope.includes,
+    }
+}
+
 fn project_conditional(c: &sast::ConditionalBlock) -> ffi::Conditional {
     let mut clauses = Vec::new();
-    let mut push = |condition: String, inst: Option<sast::Instance>| {
-        if let Some(inst) = inst {
-            clauses.push(ffi::CondClause {
-                condition,
-                instance: project_instance(&inst),
-            });
-        }
-    };
     if let Some(iff) = c.if_clause() {
-        push(iff.condition().unwrap_or_default(), iff.body_instance());
+        clauses.push(ffi::CondClause {
+            condition: iff.condition().unwrap_or_default(),
+            body: project_block(iff.body()),
+        });
     }
     for ei in c.else_ifs() {
-        push(ei.condition().unwrap_or_default(), ei.body_instance());
+        clauses.push(ffi::CondClause {
+            condition: ei.condition().unwrap_or_default(),
+            body: project_block(ei.body()),
+        });
     }
     if let Some(els) = c.else_clause() {
-        push(String::new(), els.body_instance());
+        clauses.push(ffi::CondClause {
+            condition: String::new(),
+            body: project_block(els.body()),
+        });
     }
     ffi::Conditional { clauses }
 }
@@ -1210,9 +1236,35 @@ mod tests {
         let cl = &s.conditionals[0].clauses;
         assert_eq!(cl.len(), 2);
         assert_eq!(cl[0].condition, "l < 0.5u");
-        assert_eq!(cl[0].instance.name, "m1");
+        assert_eq!(cl[0].body.instances.len(), 1);
+        assert_eq!(cl[0].body.instances[0].name, "m1");
         assert_eq!(cl[1].condition, "");
-        assert_eq!(cl[1].instance.master, "longmod");
+        assert_eq!(cl[1].body.instances.len(), 1);
+        assert_eq!(cl[1].body.instances[0].master, "longmod");
+    }
+
+    #[test]
+    fn projects_multi_statement_conditional_body() {
+        // A real PDK-shaped body: an instance plus an `include`, and a
+        // brace on the line after the condition.
+        let nl = parse_netlist(
+            "subckt s1 (a b)\n\
+             if (sxcalc > 0)\n\
+             {\n\
+             xsub a waferBack! sxmodel\n\
+             include \"./extra.scs\"\n\
+             }\n\
+             ends s1\n",
+            "spectre",
+        );
+        assert_eq!(nl.errors.len(), 0);
+        let cl = &nl.subckts[0].conditionals[0].clauses;
+        assert_eq!(cl.len(), 1);
+        assert_eq!(cl[0].condition, "sxcalc > 0");
+        assert_eq!(cl[0].body.instances.len(), 1);
+        assert_eq!(cl[0].body.instances[0].master, "sxmodel");
+        assert_eq!(cl[0].body.includes.len(), 1);
+        assert_eq!(cl[0].body.includes[0].path, "./extra.scs");
     }
 
     #[test]

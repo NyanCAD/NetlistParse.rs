@@ -22,8 +22,14 @@ fn main() -> ExitCode {
         }
     };
     let tree = if lang.as_deref() == Some("spectre") {
-        // `.scs` corpus files open in Spectre (mirrors the differential test).
-        netlist_syntax::parse_spectre(&src)
+        // `.scs` corpus files open in Spectre, `.cir` in SPICE (mirrors the
+        // differential test's `start_lang`); either may switch via `lang=`.
+        let start_lang = if path.ends_with(".cir") {
+            netlist_syntax::StartLang::Spice
+        } else {
+            netlist_syntax::StartLang::Spectre
+        };
+        netlist_syntax::parse_spectre_with(&src, start_lang, netlist_syntax::Dialect::Ngspice)
     } else {
         let dialect = match lang.as_deref() {
             Some("hspice") => netlist_syntax::Dialect::Hspice,
