@@ -505,6 +505,16 @@ impl Lexer {
         if self.accept_ch('\r') && self.accept_ch('\n') {
             return self.emit(ESCD_NEWLINE);
         }
+        // Cadence tolerates trailing whitespace between the continuation
+        // backslash and the newline (`... \ `), which the 45SPCLO `_eda`
+        // wrappers use. Consume it so the line still folds; rewind if what
+        // follows is not a newline (then `\` starts an escaped identifier).
+        let saved = self.i;
+        self.accept_batch(|c| c == ' ' || c == '\t');
+        if self.accept_ch('\n') || (self.accept_ch('\r') && self.accept_ch('\n')) {
+            return self.emit(ESCD_NEWLINE);
+        }
+        self.i = saved;
         self.lex_escaped_identifier()
     }
 

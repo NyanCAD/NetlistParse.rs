@@ -152,10 +152,16 @@ impl<'a> Parser<'a> {
     /// Hand off to the SPICE parser for a `simulator lang=spice` region: move
     /// the shared builder across, parse a `SPICENetlistSource` from `start_byte`
     /// until the dialect switches back, then resync the Spectre cursor.
-    fn handoff_to_spice(&mut self, start_byte: u32) {
+    fn handoff_to_spice(&mut self, start_byte: u32, implicit_title: bool) {
         let builder = std::mem::replace(&mut self.builder, GreenNodeBuilder::new());
-        let (builder, stop, errored) =
-            crate::parser::parse_spice_region(self.src, self.dialect, builder, start_byte, true);
+        let (builder, stop, errored) = crate::parser::parse_spice_region(
+            self.src,
+            self.dialect,
+            builder,
+            start_byte,
+            true,
+            implicit_title,
+        );
         self.builder = builder;
         self.errored |= errored;
         self.resync_at(stop);
@@ -545,13 +551,17 @@ impl<'a> Parser<'a> {
         // returns to the Spectre driver. This handoff does NOT set the Spectre
         // `lang_swapped` flag (the SPICE parser's own flag drove the return).
         if start_lang == StartLang::Spice {
-            self.handoff_to_spice(0);
+            // Whole-file SPICE start (`.cir`): the first line is the implicit
+            // `.TITLE`.
+            self.handoff_to_spice(0, true);
         }
         while self.nt.kind != ENDMARKER {
             let _ = self.parse_source();
             if self.lang_swapped {
                 let byte = self.next_emit_byte();
-                self.handoff_to_spice(byte);
+                // A mid-file `simulator lang=spice` switch has no title: the
+                // file's first line (if any) was already consumed by Spectre.
+                self.handoff_to_spice(byte, false);
             }
         }
         self.flush_trivia(self.raw.len()); // trailing trivia (ENDMARKER is zero-width)

@@ -76,8 +76,9 @@ impl<'a> Parser<'a> {
         builder: GreenNodeBuilder<'static>,
         start_byte: u32,
         return_on_language_change: bool,
+        implicit_title: bool,
     ) -> Self {
-        let raw = Lexer::tokenize_from(src, dialect, false, false, true, start_byte);
+        let raw = Lexer::tokenize_from(src, dialect, false, false, implicit_title, start_byte);
         Self::from_raw(src, raw, builder, return_on_language_change)
     }
 
@@ -1726,6 +1727,9 @@ pub fn parse(src: &str, dialect: Dialect) -> SyntaxNode {
 
 /// Parse a SPICE region (for `simulator lang=` switching) into the *shared*
 /// `builder`, starting at byte `start_byte`. Emits a `SPICENetlistSource` node.
+/// `implicit_title` seeds the SPICE implicit `.TITLE` for the region's first
+/// line — `true` for a whole-file SPICE start (`.cir`), `false` for a mid-file
+/// `simulator lang=spice` switch (a title only belongs to a file's first line).
 /// Returns `(builder, stop_byte, errored)` where `stop_byte` is where the
 /// Spectre driver should resume. Mirrors the SPICE-side of the Julia
 /// `SpectreNetlistCSTParser.parse` handoff.
@@ -1735,8 +1739,16 @@ pub(crate) fn parse_spice_region(
     builder: GreenNodeBuilder<'static>,
     start_byte: u32,
     return_on_language_change: bool,
+    implicit_title: bool,
 ) -> (GreenNodeBuilder<'static>, u32, bool) {
-    let mut p = Parser::new_region(src, dialect, builder, start_byte, return_on_language_change);
+    let mut p = Parser::new_region(
+        src,
+        dialect,
+        builder,
+        start_byte,
+        return_on_language_change,
+        implicit_title,
+    );
     let stop = p.parse_region();
     (p.builder, stop, p.errored)
 }

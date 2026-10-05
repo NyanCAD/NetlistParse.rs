@@ -65,6 +65,15 @@ fn slash_line_comments() {
 }
 
 #[test]
+fn backslash_continuation_with_trailing_space() {
+    // Cadence tolerates whitespace between a continuation `\` and the newline
+    // (`... \ `); the line must still fold.
+    let src = "* t\nr1 a b \\ \n 1k\n";
+    clean(src);
+    has_kind(src, SyntaxKind::Resistor);
+}
+
+#[test]
 fn convert_port_is_noop() {
     // `.convert_port` is a Cadence/EDA port-mapping annotation (45SPCLO `_eda`
     // wrappers); accepted as a no-op statement so the file stays lossless.
