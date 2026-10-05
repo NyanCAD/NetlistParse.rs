@@ -101,6 +101,8 @@ const KEYWORDS: &[(&str, TokenKind)] = &[
     ("sweep", SWEEP),
     ("montecarlo", MONTECARLO),
     ("section", SECTION),
+    ("endsection", ENDSECTION),
+    ("endlibrary", ENDLIBRARY),
     // --- builtin constants (KEEP uppercase; digit-free names only) ---
     ("M_DEGPERRAD", M_DEGPERRAD),
     ("M_E", M_E),

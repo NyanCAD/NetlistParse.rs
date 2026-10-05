@@ -542,6 +542,11 @@ impl<'a> Parser<'a> {
             NODESET => self.parse_nodeset(),
             REAL => self.parse_function_decl(),
             IF => self.parse_conditional_block(),
+            // PDK model-library forms.
+            LIBRARY => self.parse_library(),
+            SECTION => self.parse_section(),
+            STATISTICS => self.parse_statistics(),
+            VARY => self.parse_vary(),
             k if k.is_ident() => {
                 let cp = self.checkpoint();
                 self.bump(SyntaxKind::Identifier); // name
@@ -608,8 +613,17 @@ impl<'a> Parser<'a> {
         let cp = self.checkpoint();
         self.wrapped(cp, SyntaxKind::Parameter, |p| {
             p.take_identifier()?; // name (lenient)
-            p.accept(&[EQ])?;
-            p.parse_expression()
+                                  // `name = value` is optional: Spectre accepts a bare flag parameter
+                                  // (`parameters swap=0 ch_pwr0 ch_pwr1`).
+            if p.nt.kind == EQ {
+                p.take(&[EQ])?;
+                p.parse_expression()?;
+            }
+            // Spectre accepts a `;` terminator after a value (`-6.4u ;`).
+            if p.nt.kind == SEMICOLON {
+                p.take(&[SEMICOLON])?;
+            }
+            Ok(())
         })
     }
 
@@ -798,6 +812,7 @@ impl<'a> Parser<'a> {
             SET => self.parse_named_control(cp, SET, SyntaxKind::Set),
             SHELL => self.parse_named_control(cp, SHELL, SyntaxKind::Shell),
             PARAMTEST => self.parse_named_control(cp, PARAMTEST, SyntaxKind::ParamTest),
+            ASSERT => self.parse_named_control(cp, ASSERT, SyntaxKind::Assert),
             _ => {
                 let _ = self.error(); // error!(UnknownStatement)
                 self.wrap_at(cp, SyntaxKind::Incomplete);
@@ -826,6 +841,98 @@ impl<'a> Parser<'a> {
                 p.parse_source()?;
             }
             p.accept(&[RBRACE])?;
+            p.accept_newline()
+        })
+    }
+
+    // --- model libraries: library / section ---
+
+    /// `library <name>` … `endlibrary [<name>]` (a block of `section`s and
+    /// `include`s). Ported from the PDK's `allModels.scs` / `*.lib.scs`.
+    fn parse_library(&mut self) -> PResult {
+        let cp = self.checkpoint();
+        self.wrapped(cp, SyntaxKind::Library, |p| {
+            p.take_kw(&[LIBRARY])?;
+            p.take_identifier()?; // name (lenient; may be a keyword, e.g. `global`)
+            p.accept_newline()?;
+            while p.nt.kind != ENDLIBRARY && p.nt.kind != ENDMARKER {
+                p.parse_source()?;
+            }
+            p.take_kw(&[ENDLIBRARY])?;
+            if !p.eol() {
+                p.take_identifier()?; // end name (lenient)
+            }
+            p.accept_newline()
+        })
+    }
+
+    /// `section <name>` … `endsection [<name>]`. Nests inside a `library` or
+    /// stands alone.
+    fn parse_section(&mut self) -> PResult {
+        let cp = self.checkpoint();
+        self.wrapped(cp, SyntaxKind::Section, |p| {
+            p.take_kw(&[SECTION])?;
+            p.take_identifier()?; // name (lenient)
+            p.accept_newline()?;
+            while p.nt.kind != ENDSECTION && p.nt.kind != ENDMARKER {
+                p.parse_source()?;
+            }
+            p.take_kw(&[ENDSECTION])?;
+            if !p.eol() {
+                p.take_identifier()?; // end name (lenient)
+            }
+            p.accept_newline()
+        })
+    }
+
+    // --- statistics / vary ---
+
+    /// `statistics { <body> }`; the body is `vary` statements and named
+    /// `process { … }` groups.
+    fn parse_statistics(&mut self) -> PResult {
+        let cp = self.checkpoint();
+        self.wrapped(cp, SyntaxKind::Statistics, |p| {
+            p.take_kw(&[STATISTICS])?;
+            p.accept(&[LBRACE])?;
+            p.accept_newline()?;
+            while p.nt.kind != RBRACE && p.nt.kind != ENDMARKER {
+                p.parse_stat_statement()?;
+            }
+            p.accept(&[RBRACE])?;
+            p.accept_newline()
+        })
+    }
+
+    fn parse_stat_statement(&mut self) -> PResult {
+        match self.nt.kind {
+            VARY => self.parse_vary(),
+            k if k.is_ident() => self.parse_stat_group(),
+            _ => self.parse_source(),
+        }
+    }
+
+    /// A named statistics group, `<name> { <vary…> }` (e.g. `process`).
+    fn parse_stat_group(&mut self) -> PResult {
+        let cp = self.checkpoint();
+        self.wrapped(cp, SyntaxKind::StatGroup, |p| {
+            p.take_identifier()?; // group name (`process`)
+            p.accept(&[LBRACE])?;
+            p.accept_newline()?;
+            while p.nt.kind != RBRACE && p.nt.kind != ENDMARKER {
+                p.parse_stat_statement()?;
+            }
+            p.accept(&[RBRACE])?;
+            p.accept_newline()
+        })
+    }
+
+    /// `vary <name> dist=… std=… …`.
+    fn parse_vary(&mut self) -> PResult {
+        let cp = self.checkpoint();
+        self.wrapped(cp, SyntaxKind::Vary, |p| {
+            p.take_kw(&[VARY])?;
+            p.take_identifier()?; // varied parameter name
+            p.parse_parameter_list()?;
             p.accept_newline()
         })
     }
@@ -976,7 +1083,10 @@ impl<'a> Parser<'a> {
             p.take(&[NEWLINE])?; // nl1
             p.take_kw(&[RETURN])?;
             p.parse_expression()?; // body
-            p.take(&[SEMICOLON])?;
+                                   // Spectre allows the `return` expression without a trailing `;`.
+            if p.nt.kind == SEMICOLON {
+                p.take(&[SEMICOLON])?;
+            }
             p.take(&[NEWLINE])?; // nl2
             p.take(&[RBRACE])?;
             p.take(&[NEWLINE]) // nl3
@@ -1111,7 +1221,12 @@ impl<'a> Parser<'a> {
                 self.wrap_at(cp, SyntaxKind::Incomplete);
                 return Err(());
             }
-        } else if self.nt.kind == CONDITIONAL {
+        }
+        // The ternary operator has lower precedence than any binary operator,
+        // so a full (possibly binary) expression may be its condition:
+        // `l>0?l:pleqn`, not just a primary/unary. (Rust-led; the Julia
+        // reference only checks for `?` directly after a primary.)
+        if self.nt.kind == CONDITIONAL {
             return self.wrapped(cp, SyntaxKind::TernaryExpr, |p| {
                 p.take(&[CONDITIONAL])?;
                 p.parse_expression()?; // ifcase

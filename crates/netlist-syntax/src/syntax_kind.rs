@@ -480,6 +480,13 @@ pub enum SyntaxKind {
     IncludeSection,
     AHDLInclude,
     Parameters,
+    // PDK model-library forms (Rust-led; not in the Julia reference yet).
+    Library,
+    Section,
+    Statistics,
+    StatGroup,
+    Vary,
+    Assert,
 
     #[doc(hidden)]
     __Last,
@@ -647,6 +654,12 @@ impl SyntaxKind {
             IncludeSection => "IncludeSection",
             AHDLInclude => "AHDLInclude",
             Parameters => "Parameters",
+            Library => "Library",
+            Section => "Section",
+            Statistics => "Statistics",
+            StatGroup => "StatGroup",
+            Vary => "Vary",
+            Assert => "Assert",
             __Last => "__Last",
         }
     }

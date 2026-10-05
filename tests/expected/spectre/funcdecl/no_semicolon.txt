@@ -1,0 +1,20 @@
+SpectreNetlistSource 136-174
+  FunctionDecl 136-174
+    Keyword 136-140
+    Identifier 141-144
+    Notation 144-145
+    FunctionArgs 146-152
+      FunctionDeclArg 146-152
+        Keyword 146-150
+        Identifier 151-152
+    Notation 153-154
+    Notation 155-156
+    Notation 156-157
+    Keyword 161-167
+    BinaryExpression 168-171
+      Identifier 168-169
+      Operator 169-170
+      Identifier 170-171
+    Notation 171-172
+    Notation 172-173
+    Notation 173-174
