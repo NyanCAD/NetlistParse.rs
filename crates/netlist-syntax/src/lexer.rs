@@ -342,7 +342,7 @@ impl Lexer {
         } else if !self.lexed_nontriv_token_line && is_instance_first_char(c) {
             self.lex_instance(c)
         } else if c == '/' {
-            self.emit(SLASH)
+            self.lex_slash()
         } else if c == '\\' {
             self.lex_backslash()
         } else if c == '$' {
@@ -588,6 +588,19 @@ impl Lexer {
     fn lex_semicolon(&mut self) -> RawTok {
         self.accept_batch(|c| c != '\n');
         self.emit(COMMENT)
+    }
+
+    /// `/` — division operator, except `//` which starts an end-of-line
+    /// comment. Ngspice documents `//` as a comment delimiter (alongside `$`),
+    /// and Cadence's SPICE-compat mode uses it too; no SPICE dialect gives `//`
+    /// an operator meaning, so the two-slash form is unambiguous.
+    fn lex_slash(&mut self) -> RawTok {
+        if self.accept_ch('/') {
+            self.accept_batch(|c| c != '\n');
+            self.emit(COMMENT)
+        } else {
+            self.emit(SLASH)
+        }
     }
 
     fn lex_star(&mut self) -> RawTok {

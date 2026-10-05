@@ -431,6 +431,11 @@ pub enum SyntaxKind {
     NodeSetStatement,
     NodeSetEntry,
 
+    // `.convert_port` — a Cadence/EDA port-mapping annotation. Accepted as a
+    // no-op statement (VACASK ignores it); only the 45SPCLO `_eda` wrappers use
+    // it.
+    ConvertPortStatement,
+
     // Device types unimplemented in the Julia parser but accepted by
     // ngspice/Xyce (validated against those simulators).
     MutualInductor,
@@ -614,6 +619,7 @@ impl SyntaxKind {
             GlobalParamStatement => "GlobalParamStatement",
             NodeSetStatement => "NodeSetStatement",
             NodeSetEntry => "NodeSetEntry",
+            ConvertPortStatement => "ConvertPortStatement",
             MutualInductor => "MutualInductor",
             JFET => "JFET",
             TransmissionLine => "TransmissionLine",

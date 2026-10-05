@@ -533,6 +533,7 @@ impl<'a> Parser<'a> {
                 "func" | "function" => self.parse_named_expr_list(cp, SyntaxKind::FuncStatement),
                 "global_param" => self.parse_named_param_list(cp, SyntaxKind::GlobalParamStatement),
                 "nodeset" => self.parse_nodeset(cp),
+                "convert_port" => self.parse_convert_port(cp),
                 _ => self.error(),
             },
             _ => self.error(), // remaining dot commands not yet ported
@@ -1252,6 +1253,18 @@ impl<'a> Parser<'a> {
     fn parse_options(&mut self, cp: Checkpoint) -> PResult {
         self.wrapped(cp, SyntaxKind::OptionStatement, |p| {
             p.take_kw(&[OPTIONS])?;
+            p.parse_parameter_list()?;
+            p.accept_newline()
+        })
+    }
+
+    /// `.convert_port <port> = <name> [<port> = <name> …]` — a Cadence/EDA
+    /// port-mapping annotation found in the 45SPCLO `_eda` wrappers. Accepted
+    /// as a no-op statement: the mapping is consumed by the schematic/EDA flow,
+    /// not the simulator, so the parser only needs to keep it lossless.
+    fn parse_convert_port(&mut self, cp: Checkpoint) -> PResult {
+        self.wrapped(cp, SyntaxKind::ConvertPortStatement, |p| {
+            p.take_identifier()?; // `convert_port`
             p.parse_parameter_list()?;
             p.accept_newline()
         })
