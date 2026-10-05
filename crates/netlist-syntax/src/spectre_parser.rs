@@ -549,8 +549,9 @@ impl<'a> Parser<'a> {
             VARY => self.parse_vary(),
             k if k.is_ident() => {
                 let cp = self.checkpoint();
+                let name_kind = k;
                 self.bump(SyntaxKind::Identifier); // name
-                self.parse_other(cp)
+                self.parse_other(cp, name_kind)
             }
             _ => self.error(),
         }
@@ -729,6 +730,80 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `name n1 n2 master p=v` / `name master p=v` — an instance whose node list
+    /// is NOT parenthesised (the paren is optional in Spectre). The name has
+    /// already been bumped at `cp`.
+    ///
+    /// The node/master boundary is found the same way the SPICE parser does it
+    /// (`parser.rs` `parse_generic_device` / `parse_subckt_call`): the bare run
+    /// ends at the first token whose *next* token is `=` (the first
+    /// `name = value` parameter), or at end-of-line. All bare units but the last
+    /// are connection `SNode`s; the last is the master. (SPICE keeps the master
+    /// inside the node run because it has no `master()` accessor; Spectre peels
+    /// it off so the flat form matches the parenthesised CST.)
+    fn parse_bare_instance(&mut self, cp: Checkpoint) -> PResult {
+        // Count nodes+master up front: the master is the last bare unit before
+        // the parameter list, and rowan cannot retro-unwrap an already-emitted
+        // `SNode`, so we must know the split before emitting. A malformed tail
+        // (no bare unit, or a non-node token after the run) fails here, at the
+        // same cursor the old `_ => error()` fallback used, preserving recovery.
+        let n = match self.count_bare_units() {
+            Some(n) => n,
+            None => {
+                let _ = self.error();
+                self.wrap_at(cp, SyntaxKind::Incomplete);
+                return Err(());
+            }
+        };
+        let body = (|p: &mut Self| -> PResult {
+            for _ in 0..n - 1 {
+                p.parse_node()?; // connection nodes (flat, no SNodeList)
+            }
+            p.take_identifier()?; // master (lenient)
+            p.parse_parameter_list()?;
+            p.accept_newline()
+        })(self);
+        if body.is_err() {
+            self.wrap_at(cp, SyntaxKind::Incomplete);
+            return Err(());
+        }
+        self.wrap_at(cp, SyntaxKind::Instance);
+        Ok(())
+    }
+
+    /// Number of leading bare units (connection nodes + master) before the first
+    /// `name = …` parameter or end-of-line, or `None` if the tail is malformed
+    /// (no bare unit at all, or the run stops on a non-node token — e.g.
+    /// `return a*a;`). Dry-runs the real `parse_node` (so dotted `s1.r1` nodes
+    /// and `+` continuations are handled correctly) then restores all
+    /// cursor/emit state. Mirrors `instance_tail_ok`'s dry-run.
+    fn count_bare_units(&mut self) -> Option<usize> {
+        let saved = self.save_state();
+        self.dry = true;
+        let mut count = 0;
+        let mut clean = true;
+        while !self.eol() {
+            if self.nt.kind.is_ident() && self.nnt.kind == EQ {
+                break; // first `name = …` parameter — clean end of the bare run
+            }
+            if !(self.nt.kind.is_ident() || self.nt.kind == NUMBER) {
+                clean = false; // not a node/master/param boundary
+                break;
+            }
+            if self.parse_node().is_err() {
+                clean = false;
+                break;
+            }
+            count += 1;
+        }
+        self.restore_state(saved);
+        if clean && count > 0 {
+            Some(count)
+        } else {
+            None
+        }
+    }
+
     /// Dry-run the instance tail (`master` params newline) to learn whether it
     /// parses cleanly, without emitting anything. Restores all cursor/emit
     /// state afterwards. `master` (lenient `take_identifier`) never fails, so
@@ -797,7 +872,7 @@ impl<'a> Parser<'a> {
 
     // --- parse_other (named statements dispatched on the trailing keyword) ---
 
-    fn parse_other(&mut self, cp: Checkpoint) -> PResult {
+    fn parse_other(&mut self, cp: Checkpoint, name_kind: TokenKind) -> PResult {
         if self.nt.kind.is_analysis() {
             return self.parse_analysis_tail(cp);
         }
@@ -813,6 +888,21 @@ impl<'a> Parser<'a> {
             SHELL => self.parse_named_control(cp, SHELL, SyntaxKind::Shell),
             PARAMTEST => self.parse_named_control(cp, PARAMTEST, SyntaxKind::ParamTest),
             ASSERT => self.parse_named_control(cp, ASSERT, SyntaxKind::Assert),
+            // A stray block terminator reaching `parse_other` (its `subckt`/
+            // `library`/`section` opener failed) is never an instance — keep the
+            // old UnknownStatement recovery.
+            ENDS | ENDSECTION | ENDLIBRARY => {
+                let _ = self.error();
+                self.wrap_at(cp, SyntaxKind::Incomplete);
+                Err(())
+            }
+            // Bare / no-node instance with no parens (`name n1 n2 master p=v`).
+            // Checked last so the control keywords above still win the dispatch.
+            // The name must be a plain identifier: a keyword here is a stray
+            // structural token (e.g. `ends broken`), not an instance.
+            k if name_kind == IDENTIFIER && (k.is_ident() || k == NUMBER) => {
+                self.parse_bare_instance(cp)
+            }
             _ => {
                 let _ = self.error(); // error!(UnknownStatement)
                 self.wrap_at(cp, SyntaxKind::Incomplete);

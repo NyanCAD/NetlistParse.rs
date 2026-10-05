@@ -1,0 +1,9 @@
+SpectreNetlistSource 124-146
+  Instance 124-146
+    Identifier 124-129
+    Identifier 130-135
+    Parameter 136-145
+      Identifier 136-140
+      Notation 140-141
+      Identifier 141-145
+    Notation 145-146
