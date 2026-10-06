@@ -331,6 +331,37 @@ impl AHDLInclude {
     }
 }
 
+// --- model libraries: library / section ---
+
+ast_node!(Library);
+impl Library {
+    /// Library name (first `Identifier` token; may be a keyword, e.g. `global`).
+    pub fn name(&self) -> Option<SyntaxToken> {
+        support::token(&self.0, SyntaxKind::Identifier)
+    }
+    /// Direct `section` children of this library.
+    pub fn sections(&self) -> impl Iterator<Item = Section> + '_ {
+        support::all(&self.0)
+    }
+    /// All statement nodes directly inside the library (sections and any
+    /// non-section statements, e.g. `include`).
+    pub fn statements(&self) -> impl Iterator<Item = SyntaxNode> + '_ {
+        self.0.children()
+    }
+}
+
+ast_node!(Section);
+impl Section {
+    /// Section name (first `Identifier` token).
+    pub fn name(&self) -> Option<SyntaxToken> {
+        support::token(&self.0, SyntaxKind::Identifier)
+    }
+    /// Statements directly inside the section (models, parameters, includes, …).
+    pub fn body(&self) -> impl Iterator<Item = SyntaxNode> + '_ {
+        self.0.children()
+    }
+}
+
 // --- function declaration ---
 
 ast_node!(FunctionDecl);

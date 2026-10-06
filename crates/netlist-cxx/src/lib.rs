@@ -105,6 +105,7 @@ mod ffi {
         instances: Vec<Instance>,
         subckts: Vec<Subckt>,
         conditionals: Vec<Conditional>,
+        includes: Vec<Include>,
         spice_blocks: Vec<SpiceBlock>,
     }
 
@@ -336,6 +337,7 @@ fn project_subckt(s: &sast::Subckt) -> ffi::Subckt {
         instances: scope.instances,
         subckts: scope.subckts,
         conditionals: scope.conditionals,
+        includes: scope.includes,
         spice_blocks: scope.spice_blocks,
     }
 }
@@ -1013,19 +1015,12 @@ fn empty_netlist() -> ffi::Netlist {
     }
 }
 
-pub fn parse_netlist(src: &str, language: &str) -> ffi::Netlist {
-    let (start_lang, dialect) = match resolve_lang(language) {
-        // Spectre start: dialect is only consulted if a `simulator lang=spice`
-        // region appears; Ngspice is the harmless default there.
-        Some(Lang::Spectre) => (StartLang::Spectre, Dialect::Ngspice),
-        Some(Lang::Spice(d)) => (StartLang::Spice, d),
-        None => return lang_error_netlist(),
-    };
-    let root = parse_spectre_with(src, start_lang, dialect);
-    let errors = collect_errors(&root);
-    let incompletes = collect_incompletes(&root);
-    let source = sast::SpectreNetlistSource::cast(root).expect("root is SpectreNetlistSource");
-    let scope = collect_scope(source.statements());
+/// Build a `Netlist` from a collected Spectre scope plus the parse diagnostics.
+fn netlist_from_scope(
+    scope: Scope,
+    errors: Vec<ffi::ParseError>,
+    incompletes: Vec<ffi::ParseError>,
+) -> ffi::Netlist {
     ffi::Netlist {
         params: scope.params,
         models: scope.models,
@@ -1043,14 +1038,36 @@ pub fn parse_netlist(src: &str, language: &str) -> ffi::Netlist {
     }
 }
 
-/// Parse a SPICE `.lib` file (given `language` dialect) and project only the
-/// matching section. `spectre` is unsupported.
-pub fn parse_netlist_lib(src: &str, section: &str, language: &str) -> ffi::Netlist {
-    let dialect = match resolve_lang(language) {
-        Some(Lang::Spice(d)) => d,
-        Some(Lang::Spectre) | None => return lang_error_netlist(),
+pub fn parse_netlist(src: &str, language: &str) -> ffi::Netlist {
+    let (start_lang, dialect) = match resolve_lang(language) {
+        // Spectre start: dialect is only consulted if a `simulator lang=spice`
+        // region appears; Ngspice is the harmless default there.
+        Some(Lang::Spectre) => (StartLang::Spectre, Dialect::Ngspice),
+        Some(Lang::Spice(d)) => (StartLang::Spice, d),
+        None => return lang_error_netlist(),
     };
+    let root = parse_spectre_with(src, start_lang, dialect);
+    let errors = collect_errors(&root);
+    let incompletes = collect_incompletes(&root);
+    let source = sast::SpectreNetlistSource::cast(root).expect("root is SpectreNetlistSource");
+    let scope = collect_scope(source.statements());
+    netlist_from_scope(scope, errors, incompletes)
+}
 
+/// Parse a `.lib` file and project only the named section. SPICE dialects use
+/// the `LibStatement`/`.endl` form; `spectre` uses `library`/`section`. The
+/// selected section's statements populate the netlist's top-level scope fields
+/// (Spectre has no separate block type), so a consumer merges them into the
+/// current scope exactly as it would a flat Spectre netlist.
+pub fn parse_netlist_lib(src: &str, section: &str, language: &str) -> ffi::Netlist {
+    match resolve_lang(language) {
+        Some(Lang::Spice(dialect)) => parse_spice_lib(src, section, dialect),
+        Some(Lang::Spectre) => parse_spectre_lib(src, section),
+        None => lang_error_netlist(),
+    }
+}
+
+fn parse_spice_lib(src: &str, section: &str, dialect: Dialect) -> ffi::Netlist {
     let root = parse_spice_dialect(src, dialect);
     let errors = collect_errors(&root);
     let incompletes = collect_incompletes(&root);
@@ -1085,6 +1102,49 @@ pub fn parse_netlist_lib(src: &str, section: &str, language: &str) -> ffi::Netli
     nl.errors = errors;
     nl.incompletes = incompletes;
     nl
+}
+
+/// True when a Spectre `section`'s name matches `wanted` (case-insensitive,
+/// mirroring the SPICE `.lib` path).
+fn spectre_section_matches(sec: &sast::Section, wanted: &str) -> bool {
+    sec.name()
+        .map(|t| t.text().eq_ignore_ascii_case(wanted))
+        .unwrap_or(false)
+}
+
+fn parse_spectre_lib(src: &str, section: &str) -> ffi::Netlist {
+    let root = parse_spectre_with(src, StartLang::Spectre, Dialect::Ngspice);
+    let errors = collect_errors(&root);
+    let incompletes = collect_incompletes(&root);
+    let source = sast::SpectreNetlistSource::cast(root).expect("root is SpectreNetlistSource");
+
+    // Collect the matching section's statements. A section is either a child of
+    // a top-level `library` or a bare top-level `section`.
+    let mut selected: Vec<SyntaxNode> = Vec::new();
+    for stmt in source.statements() {
+        match stmt.kind() {
+            SyntaxKind::Library => {
+                if let Some(lib) = sast::Library::cast(stmt) {
+                    for sec in lib.sections() {
+                        if spectre_section_matches(&sec, section) {
+                            selected.extend(sec.body());
+                        }
+                    }
+                }
+            }
+            SyntaxKind::Section => {
+                if let Some(sec) = sast::Section::cast(stmt) {
+                    if spectre_section_matches(&sec, section) {
+                        selected.extend(sec.body());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let scope = collect_scope(selected.into_iter());
+    netlist_from_scope(scope, errors, incompletes)
 }
 
 #[cfg(test)]
@@ -1661,8 +1721,77 @@ mod tests {
     }
 
     #[test]
-    fn parse_netlist_lib_spectre_is_unsupported() {
-        let nl = super::parse_netlist_lib(".lib tt\n.endl tt\n", "tt", "spectre");
-        assert!(!nl.errors.is_empty());
+    fn parse_netlist_lib_spectre_extracts_section() {
+        // A Spectre library: two sections with different models/params. Selecting
+        // a section must pick exactly that section's content (case-insensitive).
+        let src = "\
+simulator lang=spectre\n\
+library global\n\
+section tt\n\
+parameters vth0_nfet = 0.4\n\
+model nfet bsimsoi type=n\n\
+endsection tt\n\
+section ff\n\
+parameters vth0_nfet = 0.35\n\
+model nfet_ff bsimsoi type=n\n\
+endsection ff\n\
+endlibrary global\n";
+        let nl = parse_netlist_lib(src, "tt", "spectre");
+        assert!(
+            nl.errors.is_empty(),
+            "unexpected errors: {}",
+            nl.errors.len()
+        );
+        assert_eq!(nl.params.len(), 1);
+        assert_eq!(nl.params[0].name, "vth0_nfet");
+        assert_eq!(nl.params[0].value, "0.4");
+        assert_eq!(nl.models.len(), 1);
+        assert_eq!(nl.models[0].name, "nfet");
+
+        // Case-insensitive match, matching the SPICE `.lib` path.
+        let nl_ff = parse_netlist_lib(src, "FF", "spectre");
+        assert_eq!(nl_ff.params[0].value, "0.35");
+        assert_eq!(nl_ff.models[0].name, "nfet_ff");
+
+        // Missing section: empty scope, no errors.
+        let nl_miss = parse_netlist_lib(src, "ss", "spectre");
+        assert!(nl_miss.errors.is_empty());
+        assert!(nl_miss.params.is_empty());
+        assert!(nl_miss.models.is_empty());
+    }
+
+    #[test]
+    fn parse_netlist_lib_spectre_bare_top_level_section() {
+        let src =
+            "simulator lang=spectre\nsection cmos\nmodel nch bsimsoi type=n\nendsection cmos\n";
+        let nl = parse_netlist_lib(src, "cmos", "spectre");
+        assert!(nl.errors.is_empty());
+        assert_eq!(nl.models.len(), 1);
+        assert_eq!(nl.models[0].master, "bsimsoi");
+    }
+
+    #[test]
+    fn projects_spectre_subckt_include_with_section() {
+        // A subckt-level `include … section=` (the PDK FET-wrapper shape) must be
+        // projected, not dropped.
+        let src = "\
+simulator lang=spectre\n\
+inline subckt adnfet (d g s x)\n\
+parameters\n\
++ w=1u\n\
+include \"./lle_param_rxj.lib.scs\" section=adnfet\n\
+model m1 nch\n\
+ends adnfet\n";
+        let nl = parse_netlist(src, "spectre");
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        assert_eq!(nl.subckts.len(), 1);
+        let s = &nl.subckts[0];
+        assert_eq!(s.includes.len(), 1);
+        assert_eq!(s.includes[0].path, "./lle_param_rxj.lib.scs");
+        assert_eq!(s.includes[0].section, "adnfet");
+        assert!(
+            nl.includes.is_empty(),
+            "subckt include must not leak to top level"
+        );
     }
 }
