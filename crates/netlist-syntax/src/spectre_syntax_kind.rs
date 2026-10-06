@@ -156,6 +156,9 @@ pub enum TokenKind {
     end_analyses,
 
     SECTION,
+    // `library`/`section` block terminators (PDK model libraries).
+    ENDSECTION,
+    ENDLIBRARY,
 
     begin_builtin_constants,
     M_1_PI,

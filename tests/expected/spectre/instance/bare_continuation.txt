@@ -1,0 +1,19 @@
+SpectreNetlistSource 157-222
+  Instance 157-222
+    Identifier 157-164
+    SNode 165-170
+      Identifier 165-170
+    SNode 171-177
+      Identifier 171-177
+    SNode 178-187
+      Identifier 178-187
+    Identifier 194-205
+    Parameter 206-213
+      Identifier 206-211
+      Notation 211-212
+      NumberLiteral 212-213
+    Parameter 214-221
+      Identifier 214-217
+      Notation 217-218
+      Identifier 218-221
+    Notation 221-222

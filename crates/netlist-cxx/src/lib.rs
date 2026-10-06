@@ -70,14 +70,26 @@ mod ffi {
         section: String,
     }
 
-    /// One clause of a conditional instantiation. `condition` is empty for the
+    /// The grouped content of one `{ … }` body (a conditional clause body).
+    /// Mirrors `Subckt`/`SpiceBlock`: a Spectre structural `if` selects a whole
+    /// block of statements, not a single instance.
+    struct Block {
+        params: Vec<Param>,
+        models: Vec<Model>,
+        instances: Vec<Instance>,
+        subckts: Vec<Subckt>,
+        conditionals: Vec<Conditional>,
+        includes: Vec<Include>,
+    }
+
+    /// One clause of a structural conditional. `condition` is empty for the
     /// trailing `else`.
     struct CondClause {
         condition: String,
-        instance: Instance,
+        body: Block,
     }
 
-    /// A conditional-instantiation block (`if/else if/else` over instances).
+    /// A structural conditional block (`if/else if/else` over a statement block).
     struct Conditional {
         clauses: Vec<CondClause>,
     }
@@ -93,6 +105,7 @@ mod ffi {
         instances: Vec<Instance>,
         subckts: Vec<Subckt>,
         conditionals: Vec<Conditional>,
+        includes: Vec<Include>,
         spice_blocks: Vec<SpiceBlock>,
     }
 
@@ -206,6 +219,11 @@ mod ffi {
         includes: Vec<Include>,
         ahdl_includes: Vec<String>,
         errors: Vec<ParseError>,
+        /// Byte spans of `Incomplete` nodes. Distinct from `errors`: an
+        /// `Incomplete` means a production could not be completed and its
+        /// content may have been dropped, even when no `Error` token was
+        /// emitted (e.g. an unterminated `subckt` at EOF).
+        incompletes: Vec<ParseError>,
         spice_blocks: Vec<SpiceBlock>,
     }
 
@@ -272,24 +290,38 @@ fn project_analysis(a: &sast::Analysis) -> ffi::Analysis {
     }
 }
 
+/// Project a clause body (an iterator of statement nodes) into a `Block`.
+fn project_block(stmts: impl Iterator<Item = SyntaxNode>) -> ffi::Block {
+    let scope = collect_scope(stmts);
+    ffi::Block {
+        params: scope.params,
+        models: scope.models,
+        instances: scope.instances,
+        subckts: scope.subckts,
+        conditionals: scope.conditionals,
+        includes: scope.includes,
+    }
+}
+
 fn project_conditional(c: &sast::ConditionalBlock) -> ffi::Conditional {
     let mut clauses = Vec::new();
-    let mut push = |condition: String, inst: Option<sast::Instance>| {
-        if let Some(inst) = inst {
-            clauses.push(ffi::CondClause {
-                condition,
-                instance: project_instance(&inst),
-            });
-        }
-    };
     if let Some(iff) = c.if_clause() {
-        push(iff.condition().unwrap_or_default(), iff.body_instance());
+        clauses.push(ffi::CondClause {
+            condition: iff.condition().unwrap_or_default(),
+            body: project_block(iff.body()),
+        });
     }
     for ei in c.else_ifs() {
-        push(ei.condition().unwrap_or_default(), ei.body_instance());
+        clauses.push(ffi::CondClause {
+            condition: ei.condition().unwrap_or_default(),
+            body: project_block(ei.body()),
+        });
     }
     if let Some(els) = c.else_clause() {
-        push(String::new(), els.body_instance());
+        clauses.push(ffi::CondClause {
+            condition: String::new(),
+            body: project_block(els.body()),
+        });
     }
     ffi::Conditional { clauses }
 }
@@ -305,6 +337,7 @@ fn project_subckt(s: &sast::Subckt) -> ffi::Subckt {
         instances: scope.instances,
         subckts: scope.subckts,
         conditionals: scope.conditionals,
+        includes: scope.includes,
         spice_blocks: scope.spice_blocks,
     }
 }
@@ -922,6 +955,22 @@ fn collect_errors(root: &SyntaxNode) -> Vec<ffi::ParseError> {
         .collect()
 }
 
+/// Collect the spans of `Incomplete` nodes. These carry no `Error` token, so
+/// they are invisible to `collect_errors`; a consumer that wants to reject a
+/// parse whose content was silently dropped must check both.
+fn collect_incompletes(root: &SyntaxNode) -> Vec<ffi::ParseError> {
+    root.descendants()
+        .filter(|e| e.kind() == SyntaxKind::Incomplete)
+        .map(|e| {
+            let r = e.text_range();
+            ffi::ParseError {
+                start: r.start().into(),
+                end: r.end().into(),
+            }
+        })
+        .collect()
+}
+
 enum Lang {
     Spice(Dialect),
     Spectre,
@@ -961,7 +1010,31 @@ fn empty_netlist() -> ffi::Netlist {
         includes: vec![],
         ahdl_includes: vec![],
         errors: vec![],
+        incompletes: vec![],
         spice_blocks: vec![],
+    }
+}
+
+/// Build a `Netlist` from a collected Spectre scope plus the parse diagnostics.
+fn netlist_from_scope(
+    scope: Scope,
+    errors: Vec<ffi::ParseError>,
+    incompletes: Vec<ffi::ParseError>,
+) -> ffi::Netlist {
+    ffi::Netlist {
+        params: scope.params,
+        models: scope.models,
+        subckts: scope.subckts,
+        instances: scope.instances,
+        analyses: scope.analyses,
+        saves: scope.saves,
+        ics: scope.ics,
+        globals: scope.globals,
+        includes: scope.includes,
+        ahdl_includes: scope.ahdl_includes,
+        errors,
+        incompletes,
+        spice_blocks: scope.spice_blocks,
     }
 }
 
@@ -975,34 +1048,29 @@ pub fn parse_netlist(src: &str, language: &str) -> ffi::Netlist {
     };
     let root = parse_spectre_with(src, start_lang, dialect);
     let errors = collect_errors(&root);
+    let incompletes = collect_incompletes(&root);
     let source = sast::SpectreNetlistSource::cast(root).expect("root is SpectreNetlistSource");
     let scope = collect_scope(source.statements());
-    ffi::Netlist {
-        params: scope.params,
-        models: scope.models,
-        subckts: scope.subckts,
-        instances: scope.instances,
-        analyses: scope.analyses,
-        saves: scope.saves,
-        ics: scope.ics,
-        globals: scope.globals,
-        includes: scope.includes,
-        ahdl_includes: scope.ahdl_includes,
-        errors,
-        spice_blocks: scope.spice_blocks,
+    netlist_from_scope(scope, errors, incompletes)
+}
+
+/// Parse a `.lib` file and project only the named section. SPICE dialects use
+/// the `LibStatement`/`.endl` form; `spectre` uses `library`/`section`. The
+/// selected section's statements populate the netlist's top-level scope fields
+/// (Spectre has no separate block type), so a consumer merges them into the
+/// current scope exactly as it would a flat Spectre netlist.
+pub fn parse_netlist_lib(src: &str, section: &str, language: &str) -> ffi::Netlist {
+    match resolve_lang(language) {
+        Some(Lang::Spice(dialect)) => parse_spice_lib(src, section, dialect),
+        Some(Lang::Spectre) => parse_spectre_lib(src, section),
+        None => lang_error_netlist(),
     }
 }
 
-/// Parse a SPICE `.lib` file (given `language` dialect) and project only the
-/// matching section. `spectre` is unsupported.
-pub fn parse_netlist_lib(src: &str, section: &str, language: &str) -> ffi::Netlist {
-    let dialect = match resolve_lang(language) {
-        Some(Lang::Spice(d)) => d,
-        Some(Lang::Spectre) | None => return lang_error_netlist(),
-    };
-
+fn parse_spice_lib(src: &str, section: &str, dialect: Dialect) -> ffi::Netlist {
     let root = parse_spice_dialect(src, dialect);
     let errors = collect_errors(&root);
+    let incompletes = collect_incompletes(&root);
 
     let mut block = ffi::SpiceBlock {
         params: vec![],
@@ -1032,7 +1100,51 @@ pub fn parse_netlist_lib(src: &str, section: &str, language: &str) -> ffi::Netli
     let mut nl = empty_netlist();
     nl.spice_blocks.push(block);
     nl.errors = errors;
+    nl.incompletes = incompletes;
     nl
+}
+
+/// True when a Spectre `section`'s name matches `wanted` (case-insensitive,
+/// mirroring the SPICE `.lib` path).
+fn spectre_section_matches(sec: &sast::Section, wanted: &str) -> bool {
+    sec.name()
+        .map(|t| t.text().eq_ignore_ascii_case(wanted))
+        .unwrap_or(false)
+}
+
+fn parse_spectre_lib(src: &str, section: &str) -> ffi::Netlist {
+    let root = parse_spectre_with(src, StartLang::Spectre, Dialect::Ngspice);
+    let errors = collect_errors(&root);
+    let incompletes = collect_incompletes(&root);
+    let source = sast::SpectreNetlistSource::cast(root).expect("root is SpectreNetlistSource");
+
+    // Collect the matching section's statements. A section is either a child of
+    // a top-level `library` or a bare top-level `section`.
+    let mut selected: Vec<SyntaxNode> = Vec::new();
+    for stmt in source.statements() {
+        match stmt.kind() {
+            SyntaxKind::Library => {
+                if let Some(lib) = sast::Library::cast(stmt) {
+                    for sec in lib.sections() {
+                        if spectre_section_matches(&sec, section) {
+                            selected.extend(sec.body());
+                        }
+                    }
+                }
+            }
+            SyntaxKind::Section => {
+                if let Some(sec) = sast::Section::cast(stmt) {
+                    if spectre_section_matches(&sec, section) {
+                        selected.extend(sec.body());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let scope = collect_scope(selected.into_iter());
+    netlist_from_scope(scope, errors, incompletes)
 }
 
 #[cfg(test)]
@@ -1210,9 +1322,35 @@ mod tests {
         let cl = &s.conditionals[0].clauses;
         assert_eq!(cl.len(), 2);
         assert_eq!(cl[0].condition, "l < 0.5u");
-        assert_eq!(cl[0].instance.name, "m1");
+        assert_eq!(cl[0].body.instances.len(), 1);
+        assert_eq!(cl[0].body.instances[0].name, "m1");
         assert_eq!(cl[1].condition, "");
-        assert_eq!(cl[1].instance.master, "longmod");
+        assert_eq!(cl[1].body.instances.len(), 1);
+        assert_eq!(cl[1].body.instances[0].master, "longmod");
+    }
+
+    #[test]
+    fn projects_multi_statement_conditional_body() {
+        // A real PDK-shaped body: an instance plus an `include`, and a
+        // brace on the line after the condition.
+        let nl = parse_netlist(
+            "subckt s1 (a b)\n\
+             if (sxcalc > 0)\n\
+             {\n\
+             xsub a waferBack! sxmodel\n\
+             include \"./extra.scs\"\n\
+             }\n\
+             ends s1\n",
+            "spectre",
+        );
+        assert_eq!(nl.errors.len(), 0);
+        let cl = &nl.subckts[0].conditionals[0].clauses;
+        assert_eq!(cl.len(), 1);
+        assert_eq!(cl[0].condition, "sxcalc > 0");
+        assert_eq!(cl[0].body.instances.len(), 1);
+        assert_eq!(cl[0].body.instances[0].master, "sxmodel");
+        assert_eq!(cl[0].body.includes.len(), 1);
+        assert_eq!(cl[0].body.includes[0].path, "./extra.scs");
     }
 
     #[test]
@@ -1514,6 +1652,38 @@ mod tests {
     }
 
     #[test]
+    fn clean_parse_has_no_incompletes() {
+        let nl = super::parse_netlist(
+            "simulator lang=spectre\nr1 (a b) resistor r=1k\n",
+            "spectre",
+        );
+        assert!(nl.errors.is_empty());
+        assert!(
+            nl.incompletes.is_empty(),
+            "clean netlist must not be incomplete"
+        );
+    }
+
+    #[test]
+    fn unterminated_subckt_is_incomplete_but_not_error() {
+        // An unterminated `subckt` at EOF yields an `Incomplete` node with no
+        // `Error` token, so it is invisible to `nl.errors`. Consumers must check
+        // `nl.incompletes` to notice that content was dropped.
+        let src = "simulator lang=spectre\nsubckt s (a b)\nparameters + x=1\n";
+        let nl = super::parse_netlist(src, "spectre");
+        assert!(
+            nl.errors.is_empty(),
+            "unexpected error token(s): {}",
+            nl.errors.len()
+        );
+        assert_eq!(
+            nl.incompletes.len(),
+            1,
+            "expected one Incomplete (the subckt)"
+        );
+    }
+
+    #[test]
     fn parse_netlist_ngspice_projects_spice_block() {
         let nl = super::parse_netlist("* t\nR1 a b 1k\n", "ngspice");
         assert!(
@@ -1551,8 +1721,77 @@ mod tests {
     }
 
     #[test]
-    fn parse_netlist_lib_spectre_is_unsupported() {
-        let nl = super::parse_netlist_lib(".lib tt\n.endl tt\n", "tt", "spectre");
-        assert!(!nl.errors.is_empty());
+    fn parse_netlist_lib_spectre_extracts_section() {
+        // A Spectre library: two sections with different models/params. Selecting
+        // a section must pick exactly that section's content (case-insensitive).
+        let src = "\
+simulator lang=spectre\n\
+library global\n\
+section tt\n\
+parameters vth0_nfet = 0.4\n\
+model nfet bsimsoi type=n\n\
+endsection tt\n\
+section ff\n\
+parameters vth0_nfet = 0.35\n\
+model nfet_ff bsimsoi type=n\n\
+endsection ff\n\
+endlibrary global\n";
+        let nl = parse_netlist_lib(src, "tt", "spectre");
+        assert!(
+            nl.errors.is_empty(),
+            "unexpected errors: {}",
+            nl.errors.len()
+        );
+        assert_eq!(nl.params.len(), 1);
+        assert_eq!(nl.params[0].name, "vth0_nfet");
+        assert_eq!(nl.params[0].value, "0.4");
+        assert_eq!(nl.models.len(), 1);
+        assert_eq!(nl.models[0].name, "nfet");
+
+        // Case-insensitive match, matching the SPICE `.lib` path.
+        let nl_ff = parse_netlist_lib(src, "FF", "spectre");
+        assert_eq!(nl_ff.params[0].value, "0.35");
+        assert_eq!(nl_ff.models[0].name, "nfet_ff");
+
+        // Missing section: empty scope, no errors.
+        let nl_miss = parse_netlist_lib(src, "ss", "spectre");
+        assert!(nl_miss.errors.is_empty());
+        assert!(nl_miss.params.is_empty());
+        assert!(nl_miss.models.is_empty());
+    }
+
+    #[test]
+    fn parse_netlist_lib_spectre_bare_top_level_section() {
+        let src =
+            "simulator lang=spectre\nsection cmos\nmodel nch bsimsoi type=n\nendsection cmos\n";
+        let nl = parse_netlist_lib(src, "cmos", "spectre");
+        assert!(nl.errors.is_empty());
+        assert_eq!(nl.models.len(), 1);
+        assert_eq!(nl.models[0].master, "bsimsoi");
+    }
+
+    #[test]
+    fn projects_spectre_subckt_include_with_section() {
+        // A subckt-level `include … section=` (the PDK FET-wrapper shape) must be
+        // projected, not dropped.
+        let src = "\
+simulator lang=spectre\n\
+inline subckt adnfet (d g s x)\n\
+parameters\n\
++ w=1u\n\
+include \"./lle_param_rxj.lib.scs\" section=adnfet\n\
+model m1 nch\n\
+ends adnfet\n";
+        let nl = parse_netlist(src, "spectre");
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        assert_eq!(nl.subckts.len(), 1);
+        let s = &nl.subckts[0];
+        assert_eq!(s.includes.len(), 1);
+        assert_eq!(s.includes[0].path, "./lle_param_rxj.lib.scs");
+        assert_eq!(s.includes[0].section, "adnfet");
+        assert!(
+            nl.includes.is_empty(),
+            "subckt include must not leak to top level"
+        );
     }
 }

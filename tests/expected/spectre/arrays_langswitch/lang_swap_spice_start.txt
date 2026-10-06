@@ -31,8 +31,17 @@ SpectreNetlistSource 0-133
     Keyword 71-76
     Notation 76-77
   SPICENetlistSource 77-110
-    Title 77-87
-      Notation 77-86
+    Resistor 77-87
+      HierarchialNode 77-79
+        NodeName 77-79
+          Identifier 77-79
+      HierarchialNode 80-81
+        NodeName 80-81
+          NumberLiteral 80-81
+      HierarchialNode 82-83
+        NodeName 82-83
+          NumberLiteral 82-83
+      NumberLiteral 84-86
       Notation 86-87
     Simulator 87-110
       Keyword 87-96

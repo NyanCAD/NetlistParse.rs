@@ -1,0 +1,24 @@
+SpectreNetlistSource 67-154
+  Library 67-154
+    Keyword 67-74
+    Identifier 75-81
+    Notation 81-82
+    Section 82-136
+      Keyword 82-89
+      Identifier 90-94
+      Notation 94-95
+      Model 95-120
+        Keyword 95-100
+        Identifier 101-104
+        Identifier 105-112
+        Parameter 113-119
+          Identifier 113-117
+          Notation 117-118
+          Identifier 118-119
+        Notation 119-120
+      Keyword 120-130
+      Identifier 131-135
+      Notation 135-136
+    Keyword 136-146
+    Identifier 147-153
+    Notation 153-154

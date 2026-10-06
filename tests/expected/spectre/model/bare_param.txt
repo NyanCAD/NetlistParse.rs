@@ -1,0 +1,7 @@
+SpectreNetlistSource 136-159
+  Model 136-159
+    Keyword 136-141
+    Identifier 142-146
+    Identifier 147-155
+    Parameter 156-159
+      Identifier 156-159
