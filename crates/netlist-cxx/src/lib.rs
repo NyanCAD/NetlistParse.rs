@@ -218,6 +218,11 @@ mod ffi {
         includes: Vec<Include>,
         ahdl_includes: Vec<String>,
         errors: Vec<ParseError>,
+        /// Byte spans of `Incomplete` nodes. Distinct from `errors`: an
+        /// `Incomplete` means a production could not be completed and its
+        /// content may have been dropped, even when no `Error` token was
+        /// emitted (e.g. an unterminated `subckt` at EOF).
+        incompletes: Vec<ParseError>,
         spice_blocks: Vec<SpiceBlock>,
     }
 
@@ -948,6 +953,22 @@ fn collect_errors(root: &SyntaxNode) -> Vec<ffi::ParseError> {
         .collect()
 }
 
+/// Collect the spans of `Incomplete` nodes. These carry no `Error` token, so
+/// they are invisible to `collect_errors`; a consumer that wants to reject a
+/// parse whose content was silently dropped must check both.
+fn collect_incompletes(root: &SyntaxNode) -> Vec<ffi::ParseError> {
+    root.descendants()
+        .filter(|e| e.kind() == SyntaxKind::Incomplete)
+        .map(|e| {
+            let r = e.text_range();
+            ffi::ParseError {
+                start: r.start().into(),
+                end: r.end().into(),
+            }
+        })
+        .collect()
+}
+
 enum Lang {
     Spice(Dialect),
     Spectre,
@@ -987,6 +1008,7 @@ fn empty_netlist() -> ffi::Netlist {
         includes: vec![],
         ahdl_includes: vec![],
         errors: vec![],
+        incompletes: vec![],
         spice_blocks: vec![],
     }
 }
@@ -1001,6 +1023,7 @@ pub fn parse_netlist(src: &str, language: &str) -> ffi::Netlist {
     };
     let root = parse_spectre_with(src, start_lang, dialect);
     let errors = collect_errors(&root);
+    let incompletes = collect_incompletes(&root);
     let source = sast::SpectreNetlistSource::cast(root).expect("root is SpectreNetlistSource");
     let scope = collect_scope(source.statements());
     ffi::Netlist {
@@ -1015,6 +1038,7 @@ pub fn parse_netlist(src: &str, language: &str) -> ffi::Netlist {
         includes: scope.includes,
         ahdl_includes: scope.ahdl_includes,
         errors,
+        incompletes,
         spice_blocks: scope.spice_blocks,
     }
 }
@@ -1029,6 +1053,7 @@ pub fn parse_netlist_lib(src: &str, section: &str, language: &str) -> ffi::Netli
 
     let root = parse_spice_dialect(src, dialect);
     let errors = collect_errors(&root);
+    let incompletes = collect_incompletes(&root);
 
     let mut block = ffi::SpiceBlock {
         params: vec![],
@@ -1058,6 +1083,7 @@ pub fn parse_netlist_lib(src: &str, section: &str, language: &str) -> ffi::Netli
     let mut nl = empty_netlist();
     nl.spice_blocks.push(block);
     nl.errors = errors;
+    nl.incompletes = incompletes;
     nl
 }
 
@@ -1562,6 +1588,38 @@ mod tests {
         assert!(
             !spectre.errors.is_empty(),
             "spectre-start should error on the SPICE line"
+        );
+    }
+
+    #[test]
+    fn clean_parse_has_no_incompletes() {
+        let nl = super::parse_netlist(
+            "simulator lang=spectre\nr1 (a b) resistor r=1k\n",
+            "spectre",
+        );
+        assert!(nl.errors.is_empty());
+        assert!(
+            nl.incompletes.is_empty(),
+            "clean netlist must not be incomplete"
+        );
+    }
+
+    #[test]
+    fn unterminated_subckt_is_incomplete_but_not_error() {
+        // An unterminated `subckt` at EOF yields an `Incomplete` node with no
+        // `Error` token, so it is invisible to `nl.errors`. Consumers must check
+        // `nl.incompletes` to notice that content was dropped.
+        let src = "simulator lang=spectre\nsubckt s (a b)\nparameters + x=1\n";
+        let nl = super::parse_netlist(src, "spectre");
+        assert!(
+            nl.errors.is_empty(),
+            "unexpected error token(s): {}",
+            nl.errors.len()
+        );
+        assert_eq!(
+            nl.incompletes.len(),
+            1,
+            "expected one Incomplete (the subckt)"
         );
     }
 
