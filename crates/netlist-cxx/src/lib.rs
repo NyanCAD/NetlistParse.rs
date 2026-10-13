@@ -94,6 +94,14 @@ mod ffi {
         clauses: Vec<CondClause>,
     }
 
+    /// A Spectre user-defined function (`real f(real a, …) { return expr; }`).
+    /// `body` is the verbatim source text of the returned expression.
+    struct FunctionDef {
+        name: String,
+        args: Vec<String>,
+        body: String,
+    }
+
     /// A `subckt`/`inline subckt` definition. Nested definitions are kept nested
     /// under `subckts`.
     struct Subckt {
@@ -218,6 +226,8 @@ mod ffi {
         globals: Vec<String>,
         includes: Vec<Include>,
         ahdl_includes: Vec<String>,
+        functions: Vec<FunctionDef>,
+        conditionals: Vec<Conditional>,
         errors: Vec<ParseError>,
         /// Byte spans of `Incomplete` nodes. Distinct from `errors`: an
         /// `Incomplete` means a production could not be completed and its
@@ -287,6 +297,14 @@ fn project_analysis(a: &sast::Analysis) -> ffi::Analysis {
         analysis_type: tok_text(a.analysis_type()),
         nodes: a.nodes().iter().map(sast::SNode::path).collect(),
         params: a.params().map(|p| project_param(&p)).collect(),
+    }
+}
+
+fn project_function(f: &sast::FunctionDecl) -> ffi::FunctionDef {
+    ffi::FunctionDef {
+        name: tok_text(f.name()),
+        args: f.args().iter().map(|a| tok_text(a.name())).collect(),
+        body: f.return_expr().unwrap_or_default(),
     }
 }
 
@@ -859,6 +877,7 @@ struct Scope {
     includes: Vec<ffi::Include>,
     ahdl_includes: Vec<String>,
     spice_blocks: Vec<ffi::SpiceBlock>,
+    functions: Vec<ffi::FunctionDef>,
 }
 
 fn collect_scope(stmts: impl Iterator<Item = SyntaxNode>) -> Scope {
@@ -878,6 +897,11 @@ fn collect_scope(stmts: impl Iterator<Item = SyntaxNode>) -> Scope {
             SyntaxKind::Subckt => {
                 if let Some(s) = sast::Subckt::cast(stmt) {
                     scope.subckts.push(project_subckt(&s));
+                }
+            }
+            SyntaxKind::FunctionDecl => {
+                if let Some(f) = sast::FunctionDecl::cast(stmt) {
+                    scope.functions.push(project_function(&f));
                 }
             }
             SyntaxKind::Parameters => {
@@ -1009,6 +1033,8 @@ fn empty_netlist() -> ffi::Netlist {
         globals: vec![],
         includes: vec![],
         ahdl_includes: vec![],
+        functions: vec![],
+        conditionals: vec![],
         errors: vec![],
         incompletes: vec![],
         spice_blocks: vec![],
@@ -1032,6 +1058,8 @@ fn netlist_from_scope(
         globals: scope.globals,
         includes: scope.includes,
         ahdl_includes: scope.ahdl_includes,
+        functions: scope.functions,
+        conditionals: scope.conditionals,
         errors,
         incompletes,
         spice_blocks: scope.spice_blocks,
@@ -1298,6 +1326,24 @@ mod tests {
         assert_eq!(nl.models[0].master, "bsim4");
         assert_eq!(nl.analyses.len(), 1);
         assert_eq!(nl.analyses[0].analysis_type, "tran");
+    }
+
+    #[test]
+    fn projects_user_function() {
+        let nl = parse_netlist(
+            "simulator lang=spectre\n\
+             real distr(real b, real n, real w, real x) {\n\
+             return n + x*(w-n) ;\n\
+             }\n\
+             parameters p=distr(1,2,3,0.5)\n",
+            "spectre",
+        );
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        assert_eq!(nl.functions.len(), 1);
+        let f = &nl.functions[0];
+        assert_eq!(f.name, "distr");
+        assert_eq!(f.args, vec!["b", "n", "w", "x"]);
+        assert_eq!(f.body, "n + x*(w-n)");
     }
 
     #[test]
