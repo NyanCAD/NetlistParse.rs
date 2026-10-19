@@ -55,6 +55,18 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all --check
 
+  python:
+    name: Python binding
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v7
+      - run: uv venv
+      - run: uv pip install ./crates/netlist-py pytest
+      - run: .venv/bin/python -m pytest crates/netlist-py/tests
+
   coverage:
     name: Coverage
     runs-on: ubuntu-latest

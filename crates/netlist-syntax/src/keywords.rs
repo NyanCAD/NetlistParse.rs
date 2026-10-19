@@ -187,6 +187,8 @@ mod tests {
         // `.param` completes to PARAMETERS.
         assert_eq!(t.lookup("PARAM"), Some(PARAMETERS));
         assert_eq!(t.lookup("PARAME"), Some(PARAMETERS));
+        // `.params` is an accepted alias for the same grouped-parameter block.
+        assert_eq!(t.lookup("PARAMS"), Some(PARAMETERS));
         // `.tra` completes to TRAN.
         assert_eq!(t.lookup("TRA"), Some(TRAN));
     }
