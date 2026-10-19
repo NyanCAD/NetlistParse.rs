@@ -1,0 +1,15 @@
+# Codecov configuration.
+#
+# The `netlist-py` crate is a thin PyO3 binding. `cargo llvm-cov` builds the
+# cdylib but never executes it, so none of its Rust lines are ever instrumented.
+# The binding is exercised by the Python test suite (`pytest
+# crates/netlist-py/tests`, run by the `Python binding` CI job) which is not
+# part of the Rust coverage run, so exclude it from line coverage here.
+coverage:
+  status:
+    project:
+      default:
+        # Tolerate small fluctuations in overall project coverage.
+        threshold: 1%
+ignore:
+  - "crates/netlist-py/**"

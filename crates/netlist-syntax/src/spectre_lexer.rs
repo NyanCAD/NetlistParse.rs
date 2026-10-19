@@ -330,11 +330,8 @@ impl Lexer {
         if self.comment_text().contains("pragma protect end_protected") {
             self.protected = false;
         }
-        if !self.accept_ch('\r') {
-            self.accept_ch('\n');
-        } else {
-            self.accept_ch('\n');
-        }
+        self.accept_ch('\r');
+        self.accept_ch('\n');
         self.emit(COMMENT)
     }
 
