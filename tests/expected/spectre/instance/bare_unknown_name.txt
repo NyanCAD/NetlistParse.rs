@@ -1,0 +1,7 @@
+SpectreNetlistSource 157-169
+  Instance 157-169
+    Identifier 157-160
+    SNode 161-164
+      Identifier 161-164
+    Identifier 165-168
+    Notation 168-169

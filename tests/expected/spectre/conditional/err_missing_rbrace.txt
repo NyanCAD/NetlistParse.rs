@@ -1,12 +1,12 @@
-SpectreNetlistSource 46-114
+SpectreNetlistSource 46-112
   Simulator 46-69
     Keyword 46-55
     Keyword 56-60
     Notation 60-61
     Keyword 61-68
     Notation 68-69
-  Incomplete 69-114
-    Incomplete 69-114
+  Incomplete 69-112
+    Incomplete 69-112
       Keyword 69-71
       Notation 72-73
       BinaryExpression 74-80
@@ -16,19 +16,18 @@ SpectreNetlistSource 46-114
       Notation 81-82
       Notation 83-84
       Notation 84-85
-      Identifier 89-91
-      Instance 91-114
-        Identifier 91-93
-        SNodeList 94-99
-          Notation 94-95
+      Instance 89-112
+        Identifier 89-91
+        SNodeList 92-97
+          Notation 92-93
+          SNode 93-94
+            Identifier 93-94
           SNode 95-96
             Identifier 95-96
-          SNode 97-98
-            Identifier 97-98
-          Notation 98-99
-        Identifier 100-108
-        Parameter 109-113
-          Identifier 109-110
-          Notation 110-111
-          NumberLiteral 111-113
-        Notation 113-114
+          Notation 96-97
+        Identifier 98-106
+        Parameter 107-111
+          Identifier 107-108
+          Notation 108-109
+          NumberLiteral 109-111
+        Notation 111-112

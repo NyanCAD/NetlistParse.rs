@@ -431,6 +431,11 @@ pub enum SyntaxKind {
     NodeSetStatement,
     NodeSetEntry,
 
+    // `.convert_port` — a Cadence/EDA port-mapping annotation. Accepted as a
+    // no-op statement (VACASK ignores it); only the 45SPCLO `_eda` wrappers use
+    // it.
+    ConvertPortStatement,
+
     // Device types unimplemented in the Julia parser but accepted by
     // ngspice/Xyce (validated against those simulators).
     MutualInductor,
@@ -480,6 +485,13 @@ pub enum SyntaxKind {
     IncludeSection,
     AHDLInclude,
     Parameters,
+    // PDK model-library forms (Rust-led; not in the Julia reference yet).
+    Library,
+    Section,
+    Statistics,
+    StatGroup,
+    Vary,
+    Assert,
 
     #[doc(hidden)]
     __Last,
@@ -607,6 +619,7 @@ impl SyntaxKind {
             GlobalParamStatement => "GlobalParamStatement",
             NodeSetStatement => "NodeSetStatement",
             NodeSetEntry => "NodeSetEntry",
+            ConvertPortStatement => "ConvertPortStatement",
             MutualInductor => "MutualInductor",
             JFET => "JFET",
             TransmissionLine => "TransmissionLine",
@@ -647,6 +660,12 @@ impl SyntaxKind {
             IncludeSection => "IncludeSection",
             AHDLInclude => "AHDLInclude",
             Parameters => "Parameters",
+            Library => "Library",
+            Section => "Section",
+            Statistics => "Statistics",
+            StatGroup => "StatGroup",
+            Vary => "Vary",
+            Assert => "Assert",
             __Last => "__Last",
         }
     }

@@ -11,3 +11,7 @@ rowan.workspace = true
 [[bin]]
 name = "dump_cst"
 path = "src/bin/dump_cst.rs"
+
+[[bin]]
+name = "spectre_parse"
+path = "src/bin/spectre_parse.rs"

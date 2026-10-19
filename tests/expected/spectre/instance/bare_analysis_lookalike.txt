@@ -1,0 +1,9 @@
+SpectreNetlistSource 288-313
+  Instance 288-313
+    Identifier 288-294
+    Identifier 295-304
+    Parameter 305-312
+      Identifier 305-309
+      Notation 309-310
+      NumberLiteral 310-312
+    Notation 312-313

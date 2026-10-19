@@ -152,10 +152,16 @@ impl<'a> Parser<'a> {
     /// Hand off to the SPICE parser for a `simulator lang=spice` region: move
     /// the shared builder across, parse a `SPICENetlistSource` from `start_byte`
     /// until the dialect switches back, then resync the Spectre cursor.
-    fn handoff_to_spice(&mut self, start_byte: u32) {
+    fn handoff_to_spice(&mut self, start_byte: u32, implicit_title: bool) {
         let builder = std::mem::replace(&mut self.builder, GreenNodeBuilder::new());
-        let (builder, stop, errored) =
-            crate::parser::parse_spice_region(self.src, self.dialect, builder, start_byte, true);
+        let (builder, stop, errored) = crate::parser::parse_spice_region(
+            self.src,
+            self.dialect,
+            builder,
+            start_byte,
+            true,
+            implicit_title,
+        );
         self.builder = builder;
         self.errored |= errored;
         self.resync_at(stop);
@@ -477,6 +483,44 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Consume a newline as `Notation` when present; otherwise leave the cursor
+    /// untouched. Unlike `accept_newline` this never enters error recovery, so
+    /// it is safe before an optional token (e.g. the `{` of a next-line block).
+    fn accept_newline_opt(&mut self) {
+        if self.nt.kind == NEWLINE {
+            self.bump(SyntaxKind::Notation);
+        } else if self.nt.kind == ENDMARKER {
+            self.flush_trivia(self.nt.idx); // zero-width nl at EOF
+        }
+    }
+
+    /// Consume a brace-delimited body: `{ [nl] item* }`. `item` is the
+    /// per-statement parser (`parse_source` for most blocks,
+    /// `parse_stat_statement` for a `statistics` body). Item failures recover
+    /// locally — the loop keeps scanning to the matching `}` so the tree stays
+    /// lossless and the block closes — but the body returns `Err` so the caller
+    /// can mark it `Incomplete`.
+    ///
+    /// The trailing newline is left to the caller: a conditional clause may be
+    /// followed by `} else {` on the same line, while `altergroup`/`statistics`
+    /// end the statement.
+    fn parse_brace_body(&mut self, item: fn(&mut Self) -> PResult) -> PResult {
+        self.accept(&[LBRACE])?;
+        self.accept_newline_opt();
+        let mut ok = true;
+        while self.nt.kind != RBRACE && self.nt.kind != ENDMARKER {
+            if item(self).is_err() {
+                ok = false;
+            }
+        }
+        self.accept(&[RBRACE])?;
+        if ok {
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+
     fn take_operator(&mut self) -> PResult {
         if self.nt.kind.is_operator() {
             self.bump(SyntaxKind::Operator);
@@ -507,13 +551,17 @@ impl<'a> Parser<'a> {
         // returns to the Spectre driver. This handoff does NOT set the Spectre
         // `lang_swapped` flag (the SPICE parser's own flag drove the return).
         if start_lang == StartLang::Spice {
-            self.handoff_to_spice(0);
+            // Whole-file SPICE start (`.cir`): the first line is the implicit
+            // `.TITLE`.
+            self.handoff_to_spice(0, true);
         }
         while self.nt.kind != ENDMARKER {
             let _ = self.parse_source();
             if self.lang_swapped {
                 let byte = self.next_emit_byte();
-                self.handoff_to_spice(byte);
+                // A mid-file `simulator lang=spice` switch has no title: the
+                // file's first line (if any) was already consumed by Spectre.
+                self.handoff_to_spice(byte, false);
             }
         }
         self.flush_trivia(self.raw.len()); // trailing trivia (ENDMARKER is zero-width)
@@ -542,10 +590,16 @@ impl<'a> Parser<'a> {
             NODESET => self.parse_nodeset(),
             REAL => self.parse_function_decl(),
             IF => self.parse_conditional_block(),
+            // PDK model-library forms.
+            LIBRARY => self.parse_library(),
+            SECTION => self.parse_section(),
+            STATISTICS => self.parse_statistics(),
+            VARY => self.parse_vary(),
             k if k.is_ident() => {
                 let cp = self.checkpoint();
+                let name_kind = k;
                 self.bump(SyntaxKind::Identifier); // name
-                self.parse_other(cp)
+                self.parse_other(cp, name_kind)
             }
             _ => self.error(),
         }
@@ -608,8 +662,17 @@ impl<'a> Parser<'a> {
         let cp = self.checkpoint();
         self.wrapped(cp, SyntaxKind::Parameter, |p| {
             p.take_identifier()?; // name (lenient)
-            p.accept(&[EQ])?;
-            p.parse_expression()
+                                  // `name = value` is optional: Spectre accepts a bare flag parameter
+                                  // (`parameters swap=0 ch_pwr0 ch_pwr1`).
+            if p.nt.kind == EQ {
+                p.take(&[EQ])?;
+                p.parse_expression()?;
+            }
+            // Spectre accepts a `;` terminator after a value (`-6.4u ;`).
+            if p.nt.kind == SEMICOLON {
+                p.take(&[SEMICOLON])?;
+            }
+            Ok(())
         })
     }
 
@@ -715,6 +778,80 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `name n1 n2 master p=v` / `name master p=v` — an instance whose node list
+    /// is NOT parenthesised (the paren is optional in Spectre). The name has
+    /// already been bumped at `cp`.
+    ///
+    /// The node/master boundary is found the same way the SPICE parser does it
+    /// (`parser.rs` `parse_generic_device` / `parse_subckt_call`): the bare run
+    /// ends at the first token whose *next* token is `=` (the first
+    /// `name = value` parameter), or at end-of-line. All bare units but the last
+    /// are connection `SNode`s; the last is the master. (SPICE keeps the master
+    /// inside the node run because it has no `master()` accessor; Spectre peels
+    /// it off so the flat form matches the parenthesised CST.)
+    fn parse_bare_instance(&mut self, cp: Checkpoint) -> PResult {
+        // Count nodes+master up front: the master is the last bare unit before
+        // the parameter list, and rowan cannot retro-unwrap an already-emitted
+        // `SNode`, so we must know the split before emitting. A malformed tail
+        // (no bare unit, or a non-node token after the run) fails here, at the
+        // same cursor the old `_ => error()` fallback used, preserving recovery.
+        let n = match self.count_bare_units() {
+            Some(n) => n,
+            None => {
+                let _ = self.error();
+                self.wrap_at(cp, SyntaxKind::Incomplete);
+                return Err(());
+            }
+        };
+        let body = (|p: &mut Self| -> PResult {
+            for _ in 0..n - 1 {
+                p.parse_node()?; // connection nodes (flat, no SNodeList)
+            }
+            p.take_identifier()?; // master (lenient)
+            p.parse_parameter_list()?;
+            p.accept_newline()
+        })(self);
+        if body.is_err() {
+            self.wrap_at(cp, SyntaxKind::Incomplete);
+            return Err(());
+        }
+        self.wrap_at(cp, SyntaxKind::Instance);
+        Ok(())
+    }
+
+    /// Number of leading bare units (connection nodes + master) before the first
+    /// `name = …` parameter or end-of-line, or `None` if the tail is malformed
+    /// (no bare unit at all, or the run stops on a non-node token — e.g.
+    /// `return a*a;`). Dry-runs the real `parse_node` (so dotted `s1.r1` nodes
+    /// and `+` continuations are handled correctly) then restores all
+    /// cursor/emit state. Mirrors `instance_tail_ok`'s dry-run.
+    fn count_bare_units(&mut self) -> Option<usize> {
+        let saved = self.save_state();
+        self.dry = true;
+        let mut count = 0;
+        let mut clean = true;
+        while !self.eol() {
+            if self.nt.kind.is_ident() && self.nnt.kind == EQ {
+                break; // first `name = …` parameter — clean end of the bare run
+            }
+            if !(self.nt.kind.is_ident() || self.nt.kind == NUMBER) {
+                clean = false; // not a node/master/param boundary
+                break;
+            }
+            if self.parse_node().is_err() {
+                clean = false;
+                break;
+            }
+            count += 1;
+        }
+        self.restore_state(saved);
+        if clean && count > 0 {
+            Some(count)
+        } else {
+            None
+        }
+    }
+
     /// Dry-run the instance tail (`master` params newline) to learn whether it
     /// parses cleanly, without emitting anything. Restores all cursor/emit
     /// state afterwards. `master` (lenient `take_identifier`) never fails, so
@@ -752,24 +889,6 @@ impl<'a> Parser<'a> {
         self.dry = s.6;
     }
 
-    /// Emit `nt`'s text as a stand-alone `Identifier` token WITHOUT advancing
-    /// the cursor. Reproduces the Julia double-capture (`@trynext name` in
-    /// `parse_if`/`parse_elseif`/`parse_else` plus `@trynext name` inside
-    /// `parse_instance`): on the failure path the same name token is rendered
-    /// twice, inflating the tree past the source by the name's width.
-    fn emit_phantom_identifier(&mut self) {
-        self.flush_trivia(self.nt.idx); // leading trivia before the phantom
-        let t = self.raw[self.nt.idx];
-        if t.end > t.start && !self.dry {
-            self.builder.token(
-                to_raw(SyntaxKind::Identifier),
-                &self.src[t.start as usize..t.end as usize],
-            );
-        }
-        // Deliberately do NOT advance the cursor or `emit_idx`: the *real*
-        // `take_identifier` re-emits the same token next.
-    }
-
     /// `parse_analysis` — `@trysetup Analysis`: a params/newline error propagates,
     /// closing the whole node as `Incomplete`. `cp` precedes the (already-emitted)
     /// name + optional nodelist.
@@ -783,7 +902,7 @@ impl<'a> Parser<'a> {
 
     // --- parse_other (named statements dispatched on the trailing keyword) ---
 
-    fn parse_other(&mut self, cp: Checkpoint) -> PResult {
+    fn parse_other(&mut self, cp: Checkpoint, name_kind: TokenKind) -> PResult {
         if self.nt.kind.is_analysis() {
             return self.parse_analysis_tail(cp);
         }
@@ -798,6 +917,22 @@ impl<'a> Parser<'a> {
             SET => self.parse_named_control(cp, SET, SyntaxKind::Set),
             SHELL => self.parse_named_control(cp, SHELL, SyntaxKind::Shell),
             PARAMTEST => self.parse_named_control(cp, PARAMTEST, SyntaxKind::ParamTest),
+            ASSERT => self.parse_named_control(cp, ASSERT, SyntaxKind::Assert),
+            // A stray block terminator reaching `parse_other` (its `subckt`/
+            // `library`/`section` opener failed) is never an instance — keep the
+            // old UnknownStatement recovery.
+            ENDS | ENDSECTION | ENDLIBRARY => {
+                let _ = self.error();
+                self.wrap_at(cp, SyntaxKind::Incomplete);
+                Err(())
+            }
+            // Bare / no-node instance with no parens (`name n1 n2 master p=v`).
+            // Checked last so the control keywords above still win the dispatch.
+            // The name must be a plain identifier: a keyword here is a stray
+            // structural token (e.g. `ends broken`), not an instance.
+            k if name_kind == IDENTIFIER && (k.is_ident() || k == NUMBER) => {
+                self.parse_bare_instance(cp)
+            }
             _ => {
                 let _ = self.error(); // error!(UnknownStatement)
                 self.wrap_at(cp, SyntaxKind::Incomplete);
@@ -820,12 +955,89 @@ impl<'a> Parser<'a> {
     fn parse_altergroup(&mut self, cp: Checkpoint) -> PResult {
         self.wrapped(cp, SyntaxKind::AlterGroup, |p| {
             p.take_kw(&[ALTERGROUP])?;
-            p.accept(&[LBRACE])?;
+            p.parse_brace_body(Self::parse_source)?;
+            p.accept_newline()
+        })
+    }
+
+    // --- model libraries: library / section ---
+
+    /// `library <name>` … `endlibrary [<name>]` (a block of `section`s and
+    /// `include`s). Ported from the PDK's `allModels.scs` / `*.lib.scs`.
+    fn parse_library(&mut self) -> PResult {
+        let cp = self.checkpoint();
+        self.wrapped(cp, SyntaxKind::Library, |p| {
+            p.take_kw(&[LIBRARY])?;
+            p.take_identifier()?; // name (lenient; may be a keyword, e.g. `global`)
             p.accept_newline()?;
-            while p.nt.kind != RBRACE && p.nt.kind != ENDMARKER {
+            while p.nt.kind != ENDLIBRARY && p.nt.kind != ENDMARKER {
                 p.parse_source()?;
             }
-            p.accept(&[RBRACE])?;
+            p.take_kw(&[ENDLIBRARY])?;
+            if !p.eol() {
+                p.take_identifier()?; // end name (lenient)
+            }
+            p.accept_newline()
+        })
+    }
+
+    /// `section <name>` … `endsection [<name>]`. Nests inside a `library` or
+    /// stands alone.
+    fn parse_section(&mut self) -> PResult {
+        let cp = self.checkpoint();
+        self.wrapped(cp, SyntaxKind::Section, |p| {
+            p.take_kw(&[SECTION])?;
+            p.take_identifier()?; // name (lenient)
+            p.accept_newline()?;
+            while p.nt.kind != ENDSECTION && p.nt.kind != ENDMARKER {
+                p.parse_source()?;
+            }
+            p.take_kw(&[ENDSECTION])?;
+            if !p.eol() {
+                p.take_identifier()?; // end name (lenient)
+            }
+            p.accept_newline()
+        })
+    }
+
+    // --- statistics / vary ---
+
+    /// `statistics { <body> }`; the body is `vary` statements and named
+    /// `process { … }` groups.
+    fn parse_statistics(&mut self) -> PResult {
+        let cp = self.checkpoint();
+        self.wrapped(cp, SyntaxKind::Statistics, |p| {
+            p.take_kw(&[STATISTICS])?;
+            p.parse_brace_body(Self::parse_stat_statement)?;
+            p.accept_newline()
+        })
+    }
+
+    fn parse_stat_statement(&mut self) -> PResult {
+        match self.nt.kind {
+            VARY => self.parse_vary(),
+            k if k.is_ident() => self.parse_stat_group(),
+            _ => self.parse_source(),
+        }
+    }
+
+    /// A named statistics group, `<name> { <vary…> }` (e.g. `process`).
+    fn parse_stat_group(&mut self) -> PResult {
+        let cp = self.checkpoint();
+        self.wrapped(cp, SyntaxKind::StatGroup, |p| {
+            p.take_identifier()?; // group name (`process`)
+            p.parse_brace_body(Self::parse_stat_statement)?;
+            p.accept_newline()
+        })
+    }
+
+    /// `vary <name> dist=… std=… …`.
+    fn parse_vary(&mut self) -> PResult {
+        let cp = self.checkpoint();
+        self.wrapped(cp, SyntaxKind::Vary, |p| {
+            p.take_kw(&[VARY])?;
+            p.take_identifier()?; // varied parameter name
+            p.parse_parameter_list()?;
             p.accept_newline()
         })
     }
@@ -976,7 +1188,10 @@ impl<'a> Parser<'a> {
             p.take(&[NEWLINE])?; // nl1
             p.take_kw(&[RETURN])?;
             p.parse_expression()?; // body
-            p.take(&[SEMICOLON])?;
+                                   // Spectre allows the `return` expression without a trailing `;`.
+            if p.nt.kind == SEMICOLON {
+                p.take(&[SEMICOLON])?;
+            }
             p.take(&[NEWLINE])?; // nl2
             p.take(&[RBRACE])?;
             p.take(&[NEWLINE]) // nl3
@@ -1017,9 +1232,7 @@ impl<'a> Parser<'a> {
             p.take_kw(&[IF])?;
             p.accept(&[LPAREN])?;
             p.parse_expression()?;
-            p.accept(&[RPAREN])?;
-            p.accept(&[LBRACE])?;
-            p.accept_newline() // nl1
+            p.accept(&[RPAREN])
         })(self);
         self.finish_conditional(cp, head, SyntaxKind::If)
     }
@@ -1031,25 +1244,18 @@ impl<'a> Parser<'a> {
             p.take_kw(&[IF])?; // kw2
             p.accept(&[LPAREN])?;
             p.parse_expression()?;
-            p.accept(&[RPAREN])?;
-            p.accept(&[LBRACE])?;
-            p.accept_newline()
+            p.accept(&[RPAREN])
         })(self);
         self.finish_conditional(cp, head, SyntaxKind::ElseIf)
     }
 
     /// `else {...}` — the leading `else` keyword has already been bumped at `cp`.
     fn parse_else(&mut self, cp: Checkpoint) -> PResult {
-        let head = (|p: &mut Self| -> PResult {
-            p.accept(&[LBRACE])?;
-            p.accept_newline()
-        })(self);
-        self.finish_conditional(cp, head, SyntaxKind::Else)
+        self.finish_conditional(cp, Ok(()), SyntaxKind::Else)
     }
 
     /// Shared close for `if`/`else if`/`else`: if the head already failed, wrap
-    /// `Incomplete`; otherwise parse the `name instance rbrace` body (with the
-    /// Julia double-capture quirk on failure) and wrap the form kind.
+    /// `Incomplete`; otherwise parse the clause body and wrap the form kind.
     fn finish_conditional(&mut self, cp: Checkpoint, head: PResult, form: SyntaxKind) -> PResult {
         if head.is_err() {
             self.wrap_at(cp, SyntaxKind::Incomplete);
@@ -1065,38 +1271,19 @@ impl<'a> Parser<'a> {
         tail
     }
 
-    /// The body of a conditional clause: `name = take_identifier;
-    /// parse_instance(name); rbrace`. On the failure path Julia's double-capture
-    /// duplicates the name (see `emit_phantom_identifier`), so we decide via a
-    /// dry run and prepend the phantom name only when the body fails.
+    /// The body of a conditional clause: a brace block of statements. Spectre's
+    /// structural `if` selects a whole block — instances, `include`s,
+    /// `parameters` and `assert`s all appear in the PDK — not a single instance.
+    ///
+    /// The PDK frequently writes the `{` on the line after the condition
+    /// (`if (sxcalc > 0)\n{`). The newline is consumed only when the following
+    /// significant token is `{`, so a braceless body still fails without having
+    /// emitted a stray `Notation`.
     fn parse_conditional_body(&mut self) -> PResult {
-        if self.conditional_body_ok() {
-            let icp = self.checkpoint();
-            let _ = self.take_identifier();
-            let _ = self.parse_instance(icp);
-            self.accept(&[RBRACE])
-        } else {
-            self.emit_phantom_identifier(); // captured `name` (double capture)
-            let icp = self.checkpoint();
-            let _ = self.take_identifier();
-            let _ = self.parse_instance(icp);
-            let _ = self.accept(&[RBRACE]);
-            Err(())
+        if self.nt.kind == NEWLINE && self.nnt.kind == LBRACE {
+            self.bump(SyntaxKind::Notation);
         }
-    }
-
-    /// Dry-run `name instance rbrace` to learn whether the clause body parses
-    /// cleanly (governs the double-capture rendering).
-    fn conditional_body_ok(&mut self) -> bool {
-        let saved = self.save_state();
-        self.dry = true;
-        let _ = self.take_identifier();
-        let icp = self.checkpoint();
-        let r = self
-            .parse_instance(icp)
-            .and_then(|_| self.accept(&[RBRACE]));
-        self.restore_state(saved);
-        r.is_ok()
+        self.parse_brace_body(Self::parse_source)
     }
 
     // --- expressions (precedence climbing) ---
@@ -1111,7 +1298,12 @@ impl<'a> Parser<'a> {
                 self.wrap_at(cp, SyntaxKind::Incomplete);
                 return Err(());
             }
-        } else if self.nt.kind == CONDITIONAL {
+        }
+        // The ternary operator has lower precedence than any binary operator,
+        // so a full (possibly binary) expression may be its condition:
+        // `l>0?l:pleqn`, not just a primary/unary. (Rust-led; the Julia
+        // reference only checks for `?` directly after a primary.)
+        if self.nt.kind == CONDITIONAL {
             return self.wrapped(cp, SyntaxKind::TernaryExpr, |p| {
                 p.take(&[CONDITIONAL])?;
                 p.parse_expression()?; // ifcase

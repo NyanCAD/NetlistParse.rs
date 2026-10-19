@@ -82,6 +82,11 @@ pub struct Lexer {
 
     last_token: TokenKind,
 
+    /// Inside a `//pragma protect begin_protected … end_protected` block: every
+    /// following line is swallowed as a single `COMMENT` (trivia) until the end
+    /// marker, keeping the CST lossless while hiding the encrypted bytes.
+    protected: bool,
+
     kw: KeywordTrie,
 }
 
@@ -104,6 +109,7 @@ impl Lexer {
             tok_start: 0,
             tok_start_ci: 0,
             last_token,
+            protected: false,
             kw: KeywordTrie::new(),
         }
     }
@@ -198,6 +204,9 @@ impl Lexer {
     // --- the state machine (tokenize/lexer.jl `next_token`) ---
 
     fn next_token(&mut self) -> RawTok {
+        if self.protected {
+            return self.lex_protected_line();
+        }
         let c = self.readchar();
 
         if c == EOF_CHAR {
@@ -290,10 +299,43 @@ impl Lexer {
         if self.peekchar() == '/' {
             // Line comment.
             self.accept_batch(|c| c != '\n');
+            // A `//pragma protect begin_protected` opens an encrypted region:
+            // the raw base64 lines that follow are not valid tokens, so the
+            // lexer swallows them as trivia until the matching end marker.
+            if self
+                .comment_text()
+                .contains("pragma protect begin_protected")
+            {
+                self.protected = true;
+            }
             self.emit(COMMENT)
         } else {
             self.emit(SLASH)
         }
+    }
+
+    /// Text consumed for the token currently being lexed (start..cursor).
+    fn comment_text(&self) -> String {
+        self.chars[self.tok_start_ci..self.i].iter().collect()
+    }
+
+    /// Inside a `//pragma protect` block: consume one line (plus its newline)
+    /// as a single `COMMENT` trivia token; close the block on `end_protected`.
+    fn lex_protected_line(&mut self) -> RawTok {
+        if self.peekchar() == EOF_CHAR {
+            self.protected = false;
+            return self.emit(ENDMARKER);
+        }
+        self.accept_batch(|c| c != '\n' && c != '\r');
+        if self.comment_text().contains("pragma protect end_protected") {
+            self.protected = false;
+        }
+        if !self.accept_ch('\r') {
+            self.accept_ch('\n');
+        } else {
+            self.accept_ch('\n');
+        }
+        self.emit(COMMENT)
     }
 
     fn lex_newline(&mut self, c: char) -> RawTok {

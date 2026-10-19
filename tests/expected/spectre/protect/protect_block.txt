@@ -1,0 +1,10 @@
+SpectreNetlistSource 297-322
+  Model 297-322
+    Keyword 297-302
+    Identifier 303-306
+    Identifier 307-314
+    Parameter 315-321
+      Identifier 315-319
+      Notation 319-320
+      Identifier 320-321
+    Notation 321-322

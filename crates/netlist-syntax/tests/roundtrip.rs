@@ -64,18 +64,6 @@ fn roundtrip_all_spectre_corpus() {
         dir.display()
     );
     for path in &files {
-        // The one documented exception to text==source: on an if/elseif/else
-        // *body* failure the Julia parser double-captures the block name and
-        // emits it twice (`parse_if` @trynext AND `parse_instance` @trynext).
-        // The Rust port faithfully reproduces this (see `emit_phantom_identifier`
-        // in spectre_parser.rs) so its *dump* byte-matches Julia — verified by
-        // the differential suite. The cost is that this single error-recovery
-        // input is intentionally non-lossless (and non-idempotent, since each
-        // re-parse re-doubles), so it cannot satisfy text==source. Skip it here;
-        // the differential test is its ground truth.
-        if path.file_name().and_then(|s| s.to_str()) == Some("err_missing_rbrace.scs") {
-            continue;
-        }
         let src = fs::read_to_string(path).unwrap();
         // `.cir` opens in SPICE, `.scs` in Spectre; either may switch dialects.
         let start_lang = match path.extension().and_then(|e| e.to_str()) {

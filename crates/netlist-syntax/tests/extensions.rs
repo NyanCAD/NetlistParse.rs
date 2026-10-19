@@ -55,6 +55,35 @@ fn extended_devices() {
 }
 
 #[test]
+fn slash_line_comments() {
+    // Ngspice documents `//` as an end-of-line comment delimiter (alongside `$`),
+    // and Cadence's SPICE-compat mode uses it too.
+    clean("* t\nr1 a b 1k // series resistor\n");
+    // A single `/` is still the division operator.
+    clean("* t\n.param half = 1/2 // one half\n");
+    clean("* t\n.param x=1\nr1 a b x//2\n");
+}
+
+#[test]
+fn backslash_continuation_with_trailing_space() {
+    // Cadence tolerates whitespace between a continuation `\` and the newline
+    // (`... \ `); the line must still fold.
+    let src = "* t\nr1 a b \\ \n 1k\n";
+    clean(src);
+    has_kind(src, SyntaxKind::Resistor);
+}
+
+#[test]
+fn convert_port_is_noop() {
+    // `.convert_port` is a Cadence/EDA port-mapping annotation (45SPCLO `_eda`
+    // wrappers); accepted as a no-op statement so the file stays lossless.
+    let src =
+        "* t\n.subckt s in out opt\n.convert_port opt = \"opt1ch\" opt2=\"opt1ch\"\n.ends s\n";
+    clean(src);
+    has_kind(src, SyntaxKind::ConvertPortStatement);
+}
+
+#[test]
 fn extended_operators() {
     // Unary ~ / ! and bitwise & | ^ and shifts — accepted by ngspice.
     clean("* t\n.param p = {~1}\n");

@@ -1,0 +1,13 @@
+SpectreNetlistSource 60-82
+  Instance 60-82
+    Identifier 60-63
+    SNode 64-65
+      NumberLiteral 64-65
+    SNode 66-67
+      NumberLiteral 66-67
+    Identifier 68-76
+    Parameter 77-81
+      Identifier 77-78
+      Notation 78-79
+      NumberLiteral 79-81
+    Notation 81-82

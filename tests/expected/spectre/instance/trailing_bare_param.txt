@@ -1,0 +1,18 @@
+SpectreNetlistSource 153-180
+  Instance 153-180
+    Identifier 153-155
+    SNodeList 156-161
+      Notation 156-157
+      SNode 157-158
+        Identifier 157-158
+      SNode 159-160
+        Identifier 159-160
+      Notation 160-161
+    Identifier 162-170
+    Parameter 171-175
+      Identifier 171-172
+      Notation 172-173
+      NumberLiteral 173-175
+    Parameter 176-179
+      Identifier 176-179
+    Notation 179-180

@@ -27,8 +27,17 @@ SpectreNetlistSource 87-219
     Keyword 148-153
     Notation 153-154
   SPICENetlistSource 154-196
-    Title 154-164
-      Notation 154-163
+    Resistor 154-164
+      HierarchialNode 154-156
+        NodeName 154-156
+          Identifier 154-156
+      HierarchialNode 157-158
+        NodeName 157-158
+          NumberLiteral 157-158
+      HierarchialNode 159-160
+        NodeName 159-160
+          NumberLiteral 159-160
+      NumberLiteral 161-163
       Notation 163-164
     Voltage 164-173
       HierarchialNode 164-166

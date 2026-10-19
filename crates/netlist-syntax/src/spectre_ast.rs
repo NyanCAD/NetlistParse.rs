@@ -331,6 +331,37 @@ impl AHDLInclude {
     }
 }
 
+// --- model libraries: library / section ---
+
+ast_node!(Library);
+impl Library {
+    /// Library name (first `Identifier` token; may be a keyword, e.g. `global`).
+    pub fn name(&self) -> Option<SyntaxToken> {
+        support::token(&self.0, SyntaxKind::Identifier)
+    }
+    /// Direct `section` children of this library.
+    pub fn sections(&self) -> impl Iterator<Item = Section> + '_ {
+        support::all(&self.0)
+    }
+    /// All statement nodes directly inside the library (sections and any
+    /// non-section statements, e.g. `include`).
+    pub fn statements(&self) -> impl Iterator<Item = SyntaxNode> + '_ {
+        self.0.children()
+    }
+}
+
+ast_node!(Section);
+impl Section {
+    /// Section name (first `Identifier` token).
+    pub fn name(&self) -> Option<SyntaxToken> {
+        support::token(&self.0, SyntaxKind::Identifier)
+    }
+    /// Statements directly inside the section (models, parameters, includes, …).
+    pub fn body(&self) -> impl Iterator<Item = SyntaxNode> + '_ {
+        self.0.children()
+    }
+}
+
 // --- function declaration ---
 
 ast_node!(FunctionDecl);
@@ -391,8 +422,15 @@ impl If {
     pub fn condition(&self) -> Option<String> {
         condition_text(&self.0)
     }
-    pub fn body_instance(&self) -> Option<Instance> {
-        support::child(&self.0)
+    /// The clause body statements (the `{ … }` block). A Spectre structural
+    /// `if` selects a whole block — instances, `include`s, `parameters`,
+    /// `assert`s — not a single instance.
+    pub fn body(&self) -> impl Iterator<Item = SyntaxNode> + '_ {
+        self.0.children()
+    }
+    /// Body instances, in source order.
+    pub fn instances(&self) -> impl Iterator<Item = Instance> + '_ {
+        support::all(&self.0)
     }
 }
 
@@ -401,15 +439,21 @@ impl ElseIf {
     pub fn condition(&self) -> Option<String> {
         condition_text(&self.0)
     }
-    pub fn body_instance(&self) -> Option<Instance> {
-        support::child(&self.0)
+    pub fn body(&self) -> impl Iterator<Item = SyntaxNode> + '_ {
+        self.0.children()
+    }
+    pub fn instances(&self) -> impl Iterator<Item = Instance> + '_ {
+        support::all(&self.0)
     }
 }
 
 ast_node!(Else);
 impl Else {
-    pub fn body_instance(&self) -> Option<Instance> {
-        support::child(&self.0)
+    pub fn body(&self) -> impl Iterator<Item = SyntaxNode> + '_ {
+        self.0.children()
+    }
+    pub fn instances(&self) -> impl Iterator<Item = Instance> + '_ {
+        support::all(&self.0)
     }
 }
 
@@ -593,7 +637,8 @@ mod tests {
         let iff = cond.if_clause().expect("if clause");
         assert_eq!(iff.condition().as_deref(), Some("l < 0.5u"));
         assert_eq!(
-            iff.body_instance()
+            iff.instances()
+                .next()
                 .and_then(|i| i.name())
                 .map(|t| t.text().to_string())
                 .as_deref(),
@@ -601,7 +646,8 @@ mod tests {
         );
         let els = cond.else_clause().expect("else clause");
         assert_eq!(
-            els.body_instance()
+            els.instances()
+                .next()
                 .and_then(|i| i.master())
                 .map(|t| t.text().to_string())
                 .as_deref(),
