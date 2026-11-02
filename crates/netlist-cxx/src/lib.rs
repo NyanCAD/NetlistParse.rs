@@ -12,7 +12,19 @@
 //! Parameter/expression values are carried as **verbatim source text**: the
 //! consumer re-parses them with its own expression engine (this mirrors how
 //! VACASK round-trips expressions through `parseExpression`, and keeps this
-//! layer free of a bespoke Spectre expression evaluator).
+//! layer free of a bespoke Spectre expression evaluator). Two dialect
+//! normalizations are applied to that text before it crosses the FFI, both
+//! using the parser's own scope knowledge so the consumer needs neither:
+//!
+//! * the ambient-temperature builtin is canonicalized to the consumer's `$temp`
+//!   (Spectre free `temp` and SPICE free `temper`), and
+//! * each **Spectre** definition's parameter list is emitted in dependency order
+//!   (an expression after the parameters it references), with a true cycle
+//!   reported through the `errors` field. SPICE lists are left in source order
+//!   (a true cycle is still reported); see the crate README for why.
+//!
+//! The FFI struct shapes are unchanged: order inside the existing `Vec`s and
+//! the rewritten text are the only signals.
 
 use netlist_syntax::ast::{self, AstNode};
 use netlist_syntax::spectre_ast as sast;
@@ -20,6 +32,8 @@ use netlist_syntax::{
     parse_spectre_with, parse_spice_dialect, Dialect, StartLang, SyntaxKind, SyntaxNode,
     SyntaxToken,
 };
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 #[cxx::bridge(namespace = "netlist")]
 mod ffi {
@@ -237,14 +251,87 @@ mod ffi {
         spice_blocks: Vec<SpiceBlock>,
     }
 
+    /// One `include` statement of a file in the consumer-supplied include
+    /// graph: the literal `path`/`section` written in that statement and the
+    /// `target` node key it resolves to.
+    struct IncludeEdge {
+        path: String,
+        section: String,
+        target: String,
+        /// True when the `include` statement sits inside a conditional clause
+        /// body in that file, so the declarations it brings are clause-gated.
+        gated: bool,
+    }
+
+    /// One file in the consumer-supplied include graph.
+    struct IncludeNode {
+        /// Opaque key identifying this file (consumer-chosen; e.g. its resolved
+        /// path, or path plus selected section). Matched against
+        /// `IncludeGraph.root` and `IncludeEdge.target`.
+        key: String,
+        /// Parameter names this file declares at definition level (outside any
+        /// conditional clause). Visible to a file that includes it at
+        /// definition level, where a declared `temp`/`temper` shadows the
+        /// ambient-temperature builtin.
+        unconditional: Vec<String>,
+        /// Parameter names this file declares inside a conditional clause. When
+        /// this file is included, they are clause-gated in the includer's scope,
+        /// so (per the builtin rule) a clause-gated `temp`/`temper` never
+        /// shadows the ambient-temperature builtin.
+        conditional: Vec<String>,
+        /// This file's own `include` statements, in source order.
+        includes: Vec<IncludeEdge>,
+    }
+
+    /// The consumer-resolved include graph, plus the scope the projected file
+    /// is merged into. The parser reads no files: the consumer resolves the
+    /// include closure, records each file's declared names and its own nested
+    /// includes, and hands the graph here. A default (empty) graph reproduces
+    /// `parse_netlist` exactly.
+    struct IncludeGraph {
+        /// Key of the file `src` projects (matched against a node's `key`).
+        /// Empty disables the graph entirely.
+        root: String,
+        /// Parameter names already visible where `src` is merged: the including
+        /// file's own parameters and the declarations of the `include`
+        /// statements that share `src`'s scope. An *included* file carries no
+        /// `include` statement for its own includer, so the parser cannot derive
+        /// these from `src` alone; the consumer passes them. Clause-gated
+        /// declarations must not appear here (they never shadow the builtin).
+        /// Empty for a top-level file.
+        inherited: Vec<String>,
+        /// One node per file the consumer wants the parser to know about.
+        nodes: Vec<IncludeNode>,
+    }
+
     extern "Rust" {
         /// Parse foreign netlist source into a flat `Netlist`. `language` is one
         /// of ngspice|hspice|pspice|xyce|spectre (case-insensitive). SPICE
         /// dialects use the SPICE parser; `spectre` uses the Spectre parser.
         fn parse_netlist(src: &str, language: &str) -> Netlist;
+        /// Like `parse_netlist`, but with a consumer-resolved `graph` of the
+        /// include closure, visible to the projection's temperature-builtin
+        /// shadowing *in the scope where each `include` sits*: the parser walks
+        /// its own `include` statements, resolves each against the graph, and
+        /// applies that file's declarations — clause-gated when the `include`
+        /// itself sits inside a clause — to the enclosing scope, following
+        /// nested includes through the graph. The graph's `inherited` list holds
+        /// the names visible where the projected file is merged (how a reference
+        /// in an *included* file sees a sibling include's declaration). Matching
+        /// is case-sensitive for Spectre and case-folded for SPICE. An empty
+        /// graph reproduces `parse_netlist` exactly.
+        fn parse_netlist_with_includes(src: &str, language: &str, graph: IncludeGraph) -> Netlist;
         /// Parse a SPICE `.lib` file (dialect per `language`) and project only
         /// the named section. `language=spectre` is unsupported (errors).
         fn parse_netlist_lib(src: &str, section: &str, language: &str) -> Netlist;
+        /// Like `parse_netlist_lib`, with an include `graph` visible to the
+        /// temperature-builtin shadowing (see `parse_netlist_with_includes`).
+        fn parse_netlist_lib_with_includes(
+            src: &str,
+            section: &str,
+            language: &str,
+            graph: IncludeGraph,
+        ) -> Netlist;
     }
 }
 
@@ -265,52 +352,450 @@ fn unquote(s: &str) -> String {
     }
 }
 
-// --- element projections ---
+// --- dialect temperature builtins and parameter ordering ---
 
-fn project_param(p: &sast::Parameter) -> ffi::Param {
-    ffi::Param {
-        name: tok_text(p.name()),
-        value: p.value_text().unwrap_or_default(),
+/// Bytes that may appear inside a dialect identifier (alnum, `_`, `$`).
+fn ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+}
+
+/// Rewrite free dialect temperature builtins to `$temp` in verbatim expression
+/// source text.
+///
+/// Spectre's `temp` and SPICE's `temper` both name the ambient simulation
+/// temperature; the consumer (VACASK) spells that builtin `$temp`. Doing the
+/// rewrite here — next to the parser's own scope knowledge — lets the consumer
+/// drop its post-parse scope re-derivation entirely.
+///
+/// An identifier is rewritten only when it is genuinely free:
+/// * not immediately a call name (`temp(...)`),
+/// * not qualified with `.` or `::` (a single ternary `:` is not qualification),
+/// * not inside a real string literal (double quotes only — a single quote is
+///   the dialects' expression wrapper, `PRIME`, not a string),
+/// * not inside a `v(...)`/`i(...)` argument list (those name nodes/branches),
+/// * not declared as a parameter in `scope` (a declaration shadows the builtin),
+/// * not part of a numeric literal (`1k`, `1e-3`).
+///
+/// Spectre matches `temp` case-sensitively (its identifiers are case-sensitive);
+/// SPICE matches `temper` case-insensitively (its identifiers are case-folded,
+/// mirroring the consumer's `spiceExpr`).
+fn rewrite_temp(text: &str, spice: bool, scope: &HashSet<String>) -> String {
+    let needle = if spice { "temper" } else { "temp" };
+    let occs = scan_expr_identifiers(text);
+    if occs.is_empty() {
+        return text.to_string();
+    }
+    let bytes = text.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(text.len() + 8);
+    let mut cursor = 0usize;
+    for o in &occs {
+        out.extend_from_slice(&bytes[cursor..o.start]);
+        let hit = if spice {
+            o.text.eq_ignore_ascii_case(needle)
+        } else {
+            o.text == needle
+        };
+        let declared = if spice {
+            scope.contains(&o.text.to_ascii_lowercase())
+        } else {
+            scope.contains(&o.text)
+        };
+        if o.free && hit && !declared {
+            out.extend_from_slice(b"$temp");
+        } else {
+            out.extend_from_slice(&bytes[o.start..o.end]);
+        }
+        cursor = o.end;
+    }
+    out.extend_from_slice(&bytes[cursor..]);
+    // Only ASCII was inserted; the input was valid UTF-8, so this cannot fail.
+    String::from_utf8(out).expect("temperature rewrite preserves UTF-8")
+}
+
+/// One identifier occurrence in verbatim expression text.
+struct ExprIdent {
+    start: usize,
+    end: usize,
+    text: String,
+    /// Not a call name, not `.`/`::`-qualified, and not inside a `v(...)`/`i(...)`
+    /// argument list — i.e. a genuinely free name.
+    free: bool,
+}
+
+/// True when a numeric literal starts at byte `i`: a digit, or a `.` directly
+/// followed by a digit (the lexers' `.5` form).
+fn number_starts_at(bytes: &[u8], i: usize) -> bool {
+    match bytes.get(i).copied() {
+        Some(b'0'..=b'9') => true,
+        Some(b'.') => matches!(bytes.get(i + 1).copied(), Some(b'0'..=b'9')),
+        _ => false,
     }
 }
 
-fn project_instance(i: &sast::Instance) -> ffi::Instance {
+/// Bytes that continue a numeric literal past its digits: the scale-factor /
+/// unit / identifier suffix run the lexers accept (`1k`, `1meg`, `2n`, `1N3064`).
+fn number_suffix_byte(b: u8) -> bool {
+    ident_byte(b) || b == b'!'
+}
+
+/// Consume a complete dialect numeric literal starting at `i`, returning its end
+/// byte index. Mirrors `lex_number`: digits, an optional fraction, an optional
+/// base specifier (`12'hAB`) or exponent (`1e-3`), then the scale-factor suffix
+/// run. Consuming the whole literal is what stops a suffix letter from being
+/// read as a free identifier (`a=1k` must not depend on `k`; `x=1e-3` must not
+/// depend on `e`).
+fn number_end(bytes: &[u8], i: usize) -> usize {
+    let mut j = i;
+    while matches!(bytes.get(j).copied(), Some(b'0'..=b'9')) {
+        j += 1;
+    }
+    if bytes.get(j) == Some(&b'.') {
+        j += 1;
+        while matches!(bytes.get(j).copied(), Some(b'0'..=b'9')) {
+            j += 1;
+        }
+    }
+    match bytes.get(j).copied() {
+        // Base specifier: `'` + base char + hex digits (e.g. `12'hAB`).
+        Some(b'\'')
+            if matches!(
+                bytes.get(j + 1).copied(),
+                Some(b'd' | b'D' | b'h' | b'H' | b'o' | b'O' | b'b' | b'B')
+            ) =>
+        {
+            j += 2;
+            while matches!(bytes.get(j).copied(), Some(c) if c.is_ascii_hexdigit()) {
+                j += 1;
+            }
+        }
+        Some(b'e') | Some(b'E') => {
+            j += 1;
+            if matches!(bytes.get(j).copied(), Some(b'+') | Some(b'-')) {
+                j += 1;
+            }
+            while matches!(bytes.get(j).copied(), Some(b'0'..=b'9')) {
+                j += 1;
+            }
+        }
+        _ => {}
+    }
+    while matches!(bytes.get(j).copied(), Some(c) if number_suffix_byte(c)) {
+        j += 1;
+    }
+    j
+}
+
+/// A name preceded or followed by `.`, or surrounded by `::`, is a member
+/// access, not a free name. A single ternary `:` is NOT qualification, so
+/// `a ? b : c` references the free names `b` and `c`.
+fn is_qualified(bytes: &[u8], start: usize, end: usize) -> bool {
+    let prev_dot = start > 0 && bytes[start - 1] == b'.';
+    let next_dot = bytes.get(end) == Some(&b'.');
+    let prev_colon2 = start >= 2 && bytes[start - 1] == b':' && bytes[start - 2] == b':';
+    let next_colon2 = bytes.get(end) == Some(&b':') && bytes.get(end + 1) == Some(&b':');
+    prev_dot || next_dot || prev_colon2 || next_colon2
+}
+
+/// Scan verbatim expression text for identifier occurrences.
+///
+/// Three details keep the scan faithful to the dialect lexers:
+/// * a complete numeric literal is consumed whole (see `number_end`), so its
+///   letters never masquerade as identifiers;
+/// * a single quote wraps an expression (`PRIME` in both lexers) and is skipped
+///   rather than opening a string, so `'temper+1'` is scanned; only a double
+///   quote opens a real string literal;
+/// * a call name (`f(`), a `v(...)`/`i(...)` argument, and a `.`/`::`-qualified
+///   name are all marked non-free.
+fn scan_expr_identifiers(text: &str) -> Vec<ExprIdent> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut access_frames: Vec<bool> = Vec::new();
+    let mut access_depth = 0usize;
+    let mut in_string = false;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_string {
+            if c == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if c == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'"' {
+            in_string = true;
+            i += 1;
+            continue;
+        }
+        if c == b'\'' {
+            // Expression wrapper (`PRIME`), not a string literal.
+            i += 1;
+            continue;
+        }
+        if number_starts_at(bytes, i) {
+            i = number_end(bytes, i);
+            continue;
+        }
+        if c.is_ascii_alphabetic() || c == b'_' || c == b'$' {
+            let start = i;
+            let mut j = i;
+            while j < bytes.len() && ident_byte(bytes[j]) {
+                j += 1;
+            }
+            let ident = &text[start..j];
+            let mut k = j;
+            while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            let is_call = k < bytes.len() && bytes[k] == b'(';
+            let qualified = is_qualified(bytes, start, j);
+            out.push(ExprIdent {
+                start,
+                end: j,
+                text: ident.to_string(),
+                free: !is_call && !qualified && access_depth == 0,
+            });
+            if is_call {
+                let is_access = ident.eq_ignore_ascii_case("v") || ident.eq_ignore_ascii_case("i");
+                access_frames.push(is_access);
+                if is_access {
+                    access_depth += 1;
+                }
+                i = k + 1;
+            } else {
+                i = j;
+            }
+            continue;
+        }
+        if c == b'(' {
+            access_frames.push(false);
+        } else if c == b')' && access_frames.pop() == Some(true) {
+            access_depth = access_depth.saturating_sub(1);
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Free identifiers referenced by an expression: those that are not call names
+/// (`f(`), not qualified (`.x`/`::x`) and not inside a `v(...)`/`i(...)`
+/// argument list. Used to build parameter dependency edges.
+fn expr_identifiers(text: &str) -> Vec<String> {
+    scan_expr_identifiers(text)
+        .into_iter()
+        .filter(|o| o.free)
+        .map(|o| o.text)
+        .collect()
+}
+/// Compute a dependency order for a parameter list: each parameter's index is
+/// placed after the indices of the parameters its value references.
+///
+/// `spice` selects the dialect's case rule for the dependency keys — SPICE
+/// identifiers are case-folded (its names are case-insensitive), Spectre's are
+/// kept verbatim — matching how `rewrite_temp` looks names up. Only the
+/// comparison keys are normalized; the emitted spelling is never touched.
+///
+/// A self-reference (a value naming its own parameter) denotes the enclosing
+/// scope and adds no edge — the same rule VACASK applies in
+/// `parameterExpressionOrder`. Independent parameters keep their source order
+/// (stable: a min-heap on the source index breaks ties), and a reference to a
+/// later parameter is an edge, so forward references are resolved. Returns
+/// `None` on a true cycle.
+fn param_order(params: &[ffi::Param], spice: bool) -> Option<Vec<usize>> {
+    let n = params.len();
+    if n <= 1 {
+        return Some((0..n).collect());
+    }
+    let key = |s: &str| -> String {
+        if spice {
+            s.to_ascii_lowercase()
+        } else {
+            s.to_string()
+        }
+    };
+    // A reference resolves to the parameter's last definition (later wins).
+    let mut index: HashMap<String, usize> = HashMap::with_capacity(n);
+    for (i, p) in params.iter().enumerate() {
+        index.insert(key(&p.name), i);
+    }
+    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut indeg = vec![0usize; n];
+    for (i, p) in params.iter().enumerate() {
+        let own = key(&p.name);
+        for r in expr_identifiers(&p.value) {
+            let rk = key(&r);
+            if rk == own {
+                // Self-reference: resolves in the enclosing scope, no edge.
+                continue;
+            }
+            if let Some(&j) = index.get(&rk) {
+                if j != i {
+                    succ[j].push(i);
+                    indeg[i] += 1;
+                }
+            }
+        }
+    }
+    drop(index);
+    let mut ready: BinaryHeap<Reverse<usize>> = BinaryHeap::new();
+    for (i, &d) in indeg.iter().enumerate() {
+        if d == 0 {
+            ready.push(Reverse(i));
+        }
+    }
+    let mut order = Vec::with_capacity(n);
+    while let Some(Reverse(i)) = ready.pop() {
+        order.push(i);
+        for &k in &succ[i] {
+            indeg[k] -= 1;
+            if indeg[k] == 0 {
+                ready.push(Reverse(k));
+            }
+        }
+    }
+    if order.len() != n {
+        return None;
+    }
+    Some(order)
+}
+
+/// Reorder a definition's parameter list into dependency order, surfacing a
+/// true cycle through `errors` (a synthetic, zero-width `ParseError` — the FFI
+/// carries no message channel) while keeping the parameters in source order
+/// rather than dropping or silently reordering them.
+///
+/// This is the **Spectre-only** ordering pass. The consumer's former sorter
+/// ordered Spectre definitions alone, and reordering a SPICE list changes name
+/// resolution (a SPICE subckt `a=b` used to read the enclosing `b`; a moved
+/// local definition would win instead). SPICE lists pass through
+/// `checked_source_order` instead.
+///
+/// Only *definition-level* (unconditional) lists are passed here. A conditional
+/// clause body's parameters are clause-gated and are deliberately never ordered
+/// — see `collect_scope` — so a cycle among them can never reach this function.
+fn ordered(params: Vec<ffi::Param>, errors: &mut Vec<ffi::ParseError>) -> Vec<ffi::Param> {
+    match param_order(&params, false) {
+        Some(order) => {
+            let mut slots: Vec<Option<ffi::Param>> = params.into_iter().map(Some).collect();
+            order
+                .into_iter()
+                .map(|i| slots[i].take().expect("each source index appears once"))
+                .collect()
+        }
+        None => {
+            errors.push(ffi::ParseError { start: 0, end: 0 });
+            params
+        }
+    }
+}
+
+/// Analyse a definition-level SPICE parameter list for a genuine cycle but leave
+/// its emitted order untouched.
+///
+/// SPICE lists are not dependency sorted (only Spectre definitions are — see
+/// `ordered`), yet a true unconditional cycle is still surfaced through `errors`
+/// as before. The dependency keys are case-folded, because SPICE identifiers are
+/// case-insensitive. Clause-gated lists never reach here (see
+/// `project_spice_block_children`).
+fn checked_source_order(
+    params: Vec<ffi::Param>,
+    errors: &mut Vec<ffi::ParseError>,
+) -> Vec<ffi::Param> {
+    if param_order(&params, true).is_none() {
+        errors.push(ffi::ParseError { start: 0, end: 0 });
+    }
+    params
+}
+
+// --- element projections ---
+
+fn project_param(p: &sast::Parameter, scope: &HashSet<String>) -> ffi::Param {
+    ffi::Param {
+        name: tok_text(p.name()),
+        value: rewrite_temp(&p.value_text().unwrap_or_default(), false, scope),
+    }
+}
+
+/// Project a **clause-gated** Spectre `parameters` entry.
+///
+/// A `temp` declared inside a conditional clause is gated by that clause, so it
+/// must not hide the builtin from the rewrite (see `collect_scope`). Instead the
+/// declared NAME is emitted as the consumer's builtin spelling `$temp`, and the
+/// value goes through the same rewrite as every other expression, so a free
+/// `temp` in the clause namespace becomes `$temp` exactly as if there were no
+/// declaration. The active clause's `$temp` then shadows the ambient option;
+/// an inactive clause leaves the ambient option visible. This is Spectre-only
+/// (`temper`, and SPICE clause handling, are unchanged).
+fn project_param_clause_gated(p: &sast::Parameter, scope: &HashSet<String>) -> ffi::Param {
+    let name = tok_text(p.name());
+    let name = if name == "temp" {
+        "$temp".to_string()
+    } else {
+        name
+    };
+    ffi::Param {
+        name,
+        value: rewrite_temp(&p.value_text().unwrap_or_default(), false, scope),
+    }
+}
+
+fn project_instance(i: &sast::Instance, scope: &HashSet<String>) -> ffi::Instance {
     ffi::Instance {
         name: tok_text(i.name()),
         master: tok_text(i.master()),
         nodes: i.nodes().iter().map(sast::SNode::path).collect(),
-        params: i.params().map(|p| project_param(&p)).collect(),
+        params: i.params().map(|p| project_param(&p, scope)).collect(),
     }
 }
 
-fn project_model(m: &sast::Model) -> ffi::Model {
+fn project_model(m: &sast::Model, scope: &HashSet<String>) -> ffi::Model {
     ffi::Model {
         name: tok_text(m.name()),
         master: tok_text(m.master()),
-        params: m.params().map(|p| project_param(&p)).collect(),
+        params: m.params().map(|p| project_param(&p, scope)).collect(),
     }
 }
 
-fn project_analysis(a: &sast::Analysis) -> ffi::Analysis {
+fn project_analysis(a: &sast::Analysis, scope: &HashSet<String>) -> ffi::Analysis {
     ffi::Analysis {
         name: tok_text(a.name()),
         analysis_type: tok_text(a.analysis_type()),
         nodes: a.nodes().iter().map(sast::SNode::path).collect(),
-        params: a.params().map(|p| project_param(&p)).collect(),
+        params: a.params().map(|p| project_param(&p, scope)).collect(),
     }
 }
 
-fn project_function(f: &sast::FunctionDecl) -> ffi::FunctionDef {
+fn project_function(f: &sast::FunctionDecl, scope: &HashSet<String>) -> ffi::FunctionDef {
+    // Function arguments are visible in the body: a `temp` argument keeps its
+    // binding, so extend the scope with them.
+    let mut body_scope = scope.clone();
+    let args: Vec<String> = f.args().iter().map(|a| tok_text(a.name())).collect();
+    for a in &args {
+        body_scope.insert(a.clone());
+    }
     ffi::FunctionDef {
         name: tok_text(f.name()),
-        args: f.args().iter().map(|a| tok_text(a.name())).collect(),
-        body: f.return_expr().unwrap_or_default(),
+        args,
+        body: rewrite_temp(&f.return_expr().unwrap_or_default(), false, &body_scope),
     }
 }
 
 /// Project a clause body (an iterator of statement nodes) into a `Block`.
-fn project_block(stmts: impl Iterator<Item = SyntaxNode>) -> ffi::Block {
-    let scope = collect_scope(stmts);
+fn project_block(
+    stmts: impl Iterator<Item = SyntaxNode>,
+    inherited: &HashSet<String>,
+    graph: &IncludeGraph,
+    errors: &mut Vec<ffi::ParseError>,
+) -> ffi::Block {
+    // A conditional clause body: `order = false`, so clause-gated parameters
+    // are never sorted and can never report a cycle (see `collect_scope`);
+    // `clause_gated = true`, so nothing declared here (locally or by a
+    // clause-level include) shadows the temperature builtin.
+    let scope = collect_scope(stmts, inherited, graph, errors, false, true);
     ffi::Block {
         params: scope.params,
         models: scope.models,
@@ -321,31 +806,41 @@ fn project_block(stmts: impl Iterator<Item = SyntaxNode>) -> ffi::Block {
     }
 }
 
-fn project_conditional(c: &sast::ConditionalBlock) -> ffi::Conditional {
+fn project_conditional(
+    c: &sast::ConditionalBlock,
+    scope: &HashSet<String>,
+    graph: &IncludeGraph,
+    errors: &mut Vec<ffi::ParseError>,
+) -> ffi::Conditional {
     let mut clauses = Vec::new();
     if let Some(iff) = c.if_clause() {
         clauses.push(ffi::CondClause {
-            condition: iff.condition().unwrap_or_default(),
-            body: project_block(iff.body()),
+            condition: rewrite_temp(&iff.condition().unwrap_or_default(), false, scope),
+            body: project_block(iff.body(), scope, graph, errors),
         });
     }
     for ei in c.else_ifs() {
         clauses.push(ffi::CondClause {
-            condition: ei.condition().unwrap_or_default(),
-            body: project_block(ei.body()),
+            condition: rewrite_temp(&ei.condition().unwrap_or_default(), false, scope),
+            body: project_block(ei.body(), scope, graph, errors),
         });
     }
     if let Some(els) = c.else_clause() {
         clauses.push(ffi::CondClause {
             condition: String::new(),
-            body: project_block(els.body()),
+            body: project_block(els.body(), scope, graph, errors),
         });
     }
     ffi::Conditional { clauses }
 }
 
-fn project_subckt(s: &sast::Subckt) -> ffi::Subckt {
-    let scope = collect_scope(s.body());
+fn project_subckt(
+    s: &sast::Subckt,
+    inherited: &HashSet<String>,
+    graph: &IncludeGraph,
+    errors: &mut Vec<ffi::ParseError>,
+) -> ffi::Subckt {
+    let scope = collect_scope(s.body(), inherited, graph, errors, true, false);
     ffi::Subckt {
         name: tok_text(s.name()),
         is_inline: s.is_inline(),
@@ -368,10 +863,14 @@ fn hier_text(h: Option<ast::HierarchialNode>) -> String {
 }
 
 /// Project a SPICE `Parameter` (name-only or `name=value`).
-fn project_spice_param(p: &ast::Parameter) -> ffi::Param {
+fn project_spice_param(p: &ast::Parameter, scope: &HashSet<String>) -> ffi::Param {
     ffi::Param {
         name: tok_text(p.name()),
-        value: p.value().map(|e| e.text()).unwrap_or_default(),
+        value: rewrite_temp(
+            &p.value().map(|e| e.text()).unwrap_or_default(),
+            true,
+            scope,
+        ),
     }
 }
 
@@ -415,25 +914,43 @@ fn empty_source() -> ffi::SpiceSource {
 
 /// Build a `SpiceSource` by walking the `DCSource`/`ACSource`/`TranSource`
 /// child nodes yielded by `Voltage::sources()` or `Current::sources()`.
-fn project_spice_source(sources: impl Iterator<Item = SyntaxNode>) -> ffi::SpiceSource {
+fn project_spice_source(
+    sources: impl Iterator<Item = SyntaxNode>,
+    scope: &HashSet<String>,
+) -> ffi::SpiceSource {
     let mut out = empty_source();
     for src in sources {
         match src.kind() {
             SyntaxKind::DCSource => {
                 if let Some(dc) = ast::DCSource::cast(src) {
-                    out.dc = dc.value().map(|e| e.text()).unwrap_or_default();
+                    out.dc = rewrite_temp(
+                        &dc.value().map(|e| e.text()).unwrap_or_default(),
+                        true,
+                        scope,
+                    );
                 }
             }
             SyntaxKind::ACSource => {
                 if let Some(ac) = ast::ACSource::cast(src) {
-                    out.ac_mag = ac.magnitude().map(|e| e.text()).unwrap_or_default();
-                    out.ac_phase = ac.phase().map(|e| e.text()).unwrap_or_default();
+                    out.ac_mag = rewrite_temp(
+                        &ac.magnitude().map(|e| e.text()).unwrap_or_default(),
+                        true,
+                        scope,
+                    );
+                    out.ac_phase = rewrite_temp(
+                        &ac.phase().map(|e| e.text()).unwrap_or_default(),
+                        true,
+                        scope,
+                    );
                 }
             }
             SyntaxKind::TranSource => {
                 if let Some(tran) = ast::TranSource::cast(src) {
                     out.tran_kind = tok_text(tran.function());
-                    out.tran_args = tran.values().map(|e| e.text()).collect();
+                    out.tran_args = tran
+                        .values()
+                        .map(|e| rewrite_temp(&e.text(), true, scope))
+                        .collect();
                 }
             }
             _ => {}
@@ -447,15 +964,19 @@ fn project_spice_source(sources: impl Iterator<Item = SyntaxNode>) -> ffi::Spice
 ///
 /// This helper is shared by `project_spice_block` and `project_spice_subckt`
 /// so that subckt bodies receive the same device coverage as the top-level block.
-fn project_spice_device(child: SyntaxNode) -> Option<ffi::SpiceDevice> {
+fn project_spice_device(child: SyntaxNode, scope: &HashSet<String>) -> Option<ffi::SpiceDevice> {
     match child.kind() {
         SyntaxKind::Resistor => ast::Resistor::cast(child).map(|r| ffi::SpiceDevice {
             kind: ffi::SpiceDeviceKind::Resistor,
             name: hier_text(r.name()),
             nodes: vec![hier_text(r.pos()), hier_text(r.neg())],
-            value: r.value().map(|e| e.text()).unwrap_or_default(),
+            value: rewrite_temp(
+                &r.value().map(|e| e.text()).unwrap_or_default(),
+                true,
+                scope,
+            ),
             model: String::new(),
-            params: r.params().map(|p| project_spice_param(&p)).collect(),
+            params: r.params().map(|p| project_spice_param(&p, scope)).collect(),
             ctrl_nodes: vec![],
             ctrl_value: String::new(),
             source: empty_source(),
@@ -464,9 +985,13 @@ fn project_spice_device(child: SyntaxNode) -> Option<ffi::SpiceDevice> {
             kind: ffi::SpiceDeviceKind::Capacitor,
             name: hier_text(c.name()),
             nodes: vec![hier_text(c.pos()), hier_text(c.neg())],
-            value: c.value().map(|e| e.text()).unwrap_or_default(),
+            value: rewrite_temp(
+                &c.value().map(|e| e.text()).unwrap_or_default(),
+                true,
+                scope,
+            ),
             model: String::new(),
-            params: c.params().map(|p| project_spice_param(&p)).collect(),
+            params: c.params().map(|p| project_spice_param(&p, scope)).collect(),
             ctrl_nodes: vec![],
             ctrl_value: String::new(),
             source: empty_source(),
@@ -475,9 +1000,13 @@ fn project_spice_device(child: SyntaxNode) -> Option<ffi::SpiceDevice> {
             kind: ffi::SpiceDeviceKind::Inductor,
             name: hier_text(l.name()),
             nodes: vec![hier_text(l.pos()), hier_text(l.neg())],
-            value: l.value().map(|e| e.text()).unwrap_or_default(),
+            value: rewrite_temp(
+                &l.value().map(|e| e.text()).unwrap_or_default(),
+                true,
+                scope,
+            ),
             model: String::new(),
-            params: l.params().map(|p| project_spice_param(&p)).collect(),
+            params: l.params().map(|p| project_spice_param(&p, scope)).collect(),
             ctrl_nodes: vec![],
             ctrl_value: String::new(),
             source: empty_source(),
@@ -491,7 +1020,7 @@ fn project_spice_device(child: SyntaxNode) -> Option<ffi::SpiceDevice> {
             params: vec![],
             ctrl_nodes: vec![],
             ctrl_value: String::new(),
-            source: project_spice_source(v.sources()),
+            source: project_spice_source(v.sources(), scope),
         }),
         SyntaxKind::Current => ast::Current::cast(child).map(|i| ffi::SpiceDevice {
             kind: ffi::SpiceDeviceKind::ISource,
@@ -502,7 +1031,7 @@ fn project_spice_device(child: SyntaxNode) -> Option<ffi::SpiceDevice> {
             params: vec![],
             ctrl_nodes: vec![],
             ctrl_value: String::new(),
-            source: project_spice_source(i.sources()),
+            source: project_spice_source(i.sources(), scope),
         }),
         SyntaxKind::Diode => ast::Diode::cast(child).map(|d| ffi::SpiceDevice {
             kind: ffi::SpiceDeviceKind::Diode,
@@ -510,7 +1039,7 @@ fn project_spice_device(child: SyntaxNode) -> Option<ffi::SpiceDevice> {
             nodes: vec![hier_text(d.pos()), hier_text(d.neg())],
             value: String::new(),
             model: hier_text(d.model()),
-            params: d.params().map(|p| project_spice_param(&p)).collect(),
+            params: d.params().map(|p| project_spice_param(&p, scope)).collect(),
             ctrl_nodes: vec![],
             ctrl_value: String::new(),
             source: empty_source(),
@@ -526,7 +1055,7 @@ fn project_spice_device(child: SyntaxNode) -> Option<ffi::SpiceDevice> {
             ],
             value: String::new(),
             model: hier_text(m.model()),
-            params: m.params().map(|p| project_spice_param(&p)).collect(),
+            params: m.params().map(|p| project_spice_param(&p, scope)).collect(),
             ctrl_nodes: vec![],
             ctrl_value: String::new(),
             source: empty_source(),
@@ -551,7 +1080,7 @@ fn project_spice_device(child: SyntaxNode) -> Option<ffi::SpiceDevice> {
                 nodes: terminals,
                 value: String::new(),
                 model,
-                params: q.params().map(|p| project_spice_param(&p)).collect(),
+                params: q.params().map(|p| project_spice_param(&p, scope)).collect(),
                 ctrl_nodes: vec![],
                 ctrl_value: String::new(),
                 source: empty_source(),
@@ -575,7 +1104,7 @@ fn project_spice_device(child: SyntaxNode) -> Option<ffi::SpiceDevice> {
                 nodes: conn_nodes,
                 value: String::new(),
                 model,
-                params: x.params().map(|p| project_spice_param(&p)).collect(),
+                params: x.params().map(|p| project_spice_param(&p, scope)).collect(),
                 ctrl_nodes: vec![],
                 ctrl_value: String::new(),
                 source: empty_source(),
@@ -607,9 +1136,11 @@ fn project_spice_device(child: SyntaxNode) -> Option<ffi::SpiceDevice> {
                         if let Some(vc) = ast::VoltageControl::cast(ctrl) {
                             let cnodes: Vec<String> =
                                 vc.control_nodes().map(|n| n.text()).collect();
-                            let cval = ctrl_value_text(vc.syntax());
-                            let ps: Vec<ffi::Param> =
-                                vc.params().map(|p| project_spice_param(&p)).collect();
+                            let cval = rewrite_temp(&ctrl_value_text(vc.syntax()), true, scope);
+                            let ps: Vec<ffi::Param> = vc
+                                .params()
+                                .map(|p| project_spice_param(&p, scope))
+                                .collect();
                             (cnodes, cval, ps)
                         } else {
                             (vec![], String::new(), vec![])
@@ -618,16 +1149,22 @@ fn project_spice_device(child: SyntaxNode) -> Option<ffi::SpiceDevice> {
                     SyntaxKind::CurrentControl => {
                         if let Some(cc) = ast::CurrentControl::cast(ctrl) {
                             let vnam = hier_text(cc.vnam());
-                            let cval = ctrl_value_text(cc.syntax());
-                            let ps: Vec<ffi::Param> =
-                                cc.params().map(|p| project_spice_param(&p)).collect();
+                            let cval = rewrite_temp(&ctrl_value_text(cc.syntax()), true, scope);
+                            let ps: Vec<ffi::Param> = cc
+                                .params()
+                                .map(|p| project_spice_param(&p, scope))
+                                .collect();
                             (vec![vnam], cval, ps)
                         } else {
                             (vec![], String::new(), vec![])
                         }
                     }
                     // POLY/TABLE: capture full node text as ctrl_value (deferred).
-                    _ => (vec![], ctrl.text().to_string(), vec![]),
+                    _ => (
+                        vec![],
+                        rewrite_temp(&ctrl.text().to_string(), true, scope),
+                        vec![],
+                    ),
                 },
                 None => (vec![], String::new(), vec![]),
             };
@@ -648,7 +1185,7 @@ fn project_spice_device(child: SyntaxNode) -> Option<ffi::SpiceDevice> {
         // nodes = [L1, L2, ...]; coupling value stored in `value`.
         SyntaxKind::MutualInductor => ast::MutualInductor::cast(child).map(|k| {
             let nodes: Vec<String> = k.inductors().map(|n| n.text()).collect();
-            let coupling = ctrl_value_text(k.syntax());
+            let coupling = rewrite_temp(&ctrl_value_text(k.syntax()), true, scope);
             ffi::SpiceDevice {
                 kind: ffi::SpiceDeviceKind::MutualInductor,
                 name: hier_text(k.name()),
@@ -686,7 +1223,7 @@ fn project_spice_device(child: SyntaxNode) -> Option<ffi::SpiceDevice> {
             nodes: vec![hier_text(b.pos()), hier_text(b.neg())],
             value: String::new(),
             model: String::new(),
-            params: b.params().map(|p| project_spice_param(&p)).collect(),
+            params: b.params().map(|p| project_spice_param(&p, scope)).collect(),
             ctrl_nodes: vec![],
             ctrl_value: String::new(),
             source: empty_source(),
@@ -702,9 +1239,9 @@ fn project_spice_device(child: SyntaxNode) -> Option<ffi::SpiceDevice> {
                 hier_text(j.gate()),
                 hier_text(j.source()),
             ],
-            value: j.area().map(|e| e.text()).unwrap_or_default(),
+            value: rewrite_temp(&j.area().map(|e| e.text()).unwrap_or_default(), true, scope),
             model: hier_text(j.model()),
-            params: j.params().map(|p| project_spice_param(&p)).collect(),
+            params: j.params().map(|p| project_spice_param(&p, scope)).collect(),
             ctrl_nodes: vec![],
             ctrl_value: String::new(),
             source: empty_source(),
@@ -726,7 +1263,7 @@ fn project_spice_device(child: SyntaxNode) -> Option<ffi::SpiceDevice> {
                 nodes: terminals,
                 value: String::new(),
                 model,
-                params: n.params().map(|p| project_spice_param(&p)).collect(),
+                params: n.params().map(|p| project_spice_param(&p, scope)).collect(),
                 ctrl_nodes: vec![],
                 ctrl_value: String::new(),
                 source: empty_source(),
@@ -739,8 +1276,8 @@ fn project_spice_device(child: SyntaxNode) -> Option<ffi::SpiceDevice> {
 
 /// Project a SPICE `.model` card into a `SpiceModel`.
 /// Extracts `level` from the params list if present (case-insensitive match).
-fn project_spice_model(m: &ast::Model) -> ffi::SpiceModel {
-    let params: Vec<ffi::Param> = m.params().map(|p| project_spice_param(&p)).collect();
+fn project_spice_model(m: &ast::Model, scope: &HashSet<String>) -> ffi::SpiceModel {
+    let params: Vec<ffi::Param> = m.params().map(|p| project_spice_param(&p, scope)).collect();
     let level = params
         .iter()
         .find(|p| p.name.eq_ignore_ascii_case("level"))
@@ -756,17 +1293,25 @@ fn project_spice_model(m: &ast::Model) -> ffi::SpiceModel {
 
 /// Preserve each branch as its own scope. Conditions depend on the eventual
 /// instance parameters, so projecting must neither evaluate nor flatten them.
-fn project_spice_conditional(c: &ast::IfBlock) -> ffi::SpiceConditional {
+fn project_spice_conditional(
+    c: &ast::IfBlock,
+    scope: &HashSet<String>,
+    errors: &mut Vec<ffi::ParseError>,
+) -> ffi::SpiceConditional {
     ffi::SpiceConditional {
         clauses: c
             .cases()
             .map(|clause| ffi::SpiceCondClause {
-                condition: clause
-                    .condition()
-                    .and_then(|condition| condition.expr())
-                    .map(|expr| expr.text().trim().to_string())
-                    .unwrap_or_default(),
-                body: project_spice_block_children(clause.body()),
+                condition: rewrite_temp(
+                    &clause
+                        .condition()
+                        .and_then(|condition| condition.expr())
+                        .map(|expr| expr.text().trim().to_string())
+                        .unwrap_or_default(),
+                    true,
+                    scope,
+                ),
+                body: project_spice_block_children(clause.body(), scope, errors, false),
             })
             .collect(),
     }
@@ -774,14 +1319,35 @@ fn project_spice_conditional(c: &ast::IfBlock) -> ffi::SpiceConditional {
 
 /// Project a SPICE `.subckt` without moving branch bodies or includes out of
 /// their defining scope. Include resolution is the consumer's responsibility.
-fn project_spice_subckt(s: &ast::Subckt) -> ffi::SpiceSubckt {
-    let body = project_spice_block_children(s.body());
-    // Formal params from the `.subckt` header (e.g. `w=1 l=1`). Internal
-    // `.param` statements from the body are appended below, after the formal
-    // params, so downstream sees them in source order (body params may depend
-    // on the formal ones).
-    let mut params: Vec<ffi::Param> = s.params().map(|p| project_spice_param(&p)).collect();
+fn project_spice_subckt(
+    s: &ast::Subckt,
+    inherited: &HashSet<String>,
+    errors: &mut Vec<ffi::ParseError>,
+) -> ffi::SpiceSubckt {
+    // Formal header params (`.subckt … w=1 l=1`) are visible to the body, so
+    // seed the body scope with them. The whole definition namespace is visible
+    // to the header defaults too: a body `.param` (even one inside `.if`) that
+    // declares `temper` shadows the ambient-temperature builtin for a header
+    // default such as `.subckt s a b p=temper`, so collect body declarations
+    // before projecting the header.
+    let header: Vec<ast::Parameter> = s.params().collect();
+    let mut scope = inherited.clone();
+    for p in &header {
+        scope.insert(tok_text(p.name()).to_ascii_lowercase());
+    }
+    let body_children: Vec<SyntaxNode> = s.body().collect();
+    collect_spice_param_names(&body_children, &mut scope);
+
+    let body = project_spice_block_children(body_children.into_iter(), &scope, errors, true);
+    // Formal params first, then body `.param` statements. SPICE lists are not
+    // reordered (only Spectre definitions are — see `ordered`); a genuine
+    // definition-level cycle is still reported.
+    let mut params: Vec<ffi::Param> = header
+        .iter()
+        .map(|p| project_spice_param(p, &scope))
+        .collect();
     params.extend(body.params);
+    let params = checked_source_order(params, errors);
     ffi::SpiceSubckt {
         name: tok_text(s.name()),
         ports: s.ports().map(|p| p.text()).collect(),
@@ -794,9 +1360,53 @@ fn project_spice_subckt(s: &ast::Subckt) -> ffi::SpiceSubckt {
     }
 }
 
+/// Collect SPICE `.param` names declared in a scope (including inside `.if`
+/// clause bodies), lowercased because SPICE identifiers are case-folded.
+fn collect_spice_param_names(children: &[SyntaxNode], out: &mut HashSet<String>) {
+    for child in children {
+        match child.kind() {
+            SyntaxKind::ParamStatement => {
+                if let Some(ps) = ast::ParamStatement::cast(child.clone()) {
+                    for p in ps.params() {
+                        out.insert(tok_text(p.name()).to_ascii_lowercase());
+                    }
+                }
+            }
+            SyntaxKind::IfBlock => {
+                if let Some(c) = ast::IfBlock::cast(child.clone()) {
+                    for clause in c.cases() {
+                        let body: Vec<SyntaxNode> = clause.body().collect();
+                        collect_spice_param_names(&body, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Project an iterator of SPICE children (params, models, subckts, devices,
 /// includes, conditionals) into a `SpiceBlock`.
-fn project_spice_block_children(children: impl Iterator<Item = SyntaxNode>) -> ffi::SpiceBlock {
+///
+/// `definition_level` mirrors `collect_scope`: `true` at a definition level,
+/// where the unconditional `.param` list is analysed for a genuine cycle (but
+/// never reordered — see `checked_source_order`); `false` inside a conditional
+/// clause body, whose `.param` names are clause-gated and resolved by the
+/// consumer (only the active clauses run), so they are left in source order and
+/// never report a cycle — the FFI `errors` channel is a bare span and cannot
+/// distinguish "harmless cycle in an unselected clause" from a genuine error.
+fn project_spice_block_children(
+    children: impl Iterator<Item = SyntaxNode>,
+    inherited: &HashSet<String>,
+    errors: &mut Vec<ffi::ParseError>,
+    definition_level: bool,
+) -> ffi::SpiceBlock {
+    let children: Vec<SyntaxNode> = children.collect();
+    // `.param` declarations (including those inside `.if` clause bodies) are
+    // visible to every expression in this scope.
+    let mut scope = inherited.clone();
+    collect_spice_param_names(&children, &mut scope);
+
     let mut block = ffi::SpiceBlock {
         params: vec![],
         models: vec![],
@@ -805,27 +1415,27 @@ fn project_spice_block_children(children: impl Iterator<Item = SyntaxNode>) -> f
         includes: vec![],
         conditionals: vec![],
     };
-    for child in children {
+    for child in &children {
         match child.kind() {
             SyntaxKind::ParamStatement => {
-                if let Some(ps) = ast::ParamStatement::cast(child) {
+                if let Some(ps) = ast::ParamStatement::cast(child.clone()) {
                     for p in ps.params() {
-                        block.params.push(project_spice_param(&p));
+                        block.params.push(project_spice_param(&p, &scope));
                     }
                 }
             }
             SyntaxKind::Model => {
-                if let Some(m) = ast::Model::cast(child) {
-                    block.models.push(project_spice_model(&m));
+                if let Some(m) = ast::Model::cast(child.clone()) {
+                    block.models.push(project_spice_model(&m, &scope));
                 }
             }
             SyntaxKind::Subckt => {
-                if let Some(s) = ast::Subckt::cast(child) {
-                    block.subckts.push(project_spice_subckt(&s));
+                if let Some(s) = ast::Subckt::cast(child.clone()) {
+                    block.subckts.push(project_spice_subckt(&s, &scope, errors));
                 }
             }
             SyntaxKind::IncludeStatement => {
-                if let Some(inc) = ast::IncludeStatement::cast(child) {
+                if let Some(inc) = ast::IncludeStatement::cast(child.clone()) {
                     block.includes.push(ffi::Include {
                         path: unquote(&tok_text(inc.path())),
                         section: String::new(),
@@ -833,7 +1443,7 @@ fn project_spice_block_children(children: impl Iterator<Item = SyntaxNode>) -> f
                 }
             }
             SyntaxKind::LibInclude => {
-                if let Some(lib) = ast::LibInclude::cast(child) {
+                if let Some(lib) = ast::LibInclude::cast(child.clone()) {
                     block.includes.push(ffi::Include {
                         path: unquote(&tok_text(lib.path())),
                         section: tok_text(lib.section()),
@@ -841,25 +1451,34 @@ fn project_spice_block_children(children: impl Iterator<Item = SyntaxNode>) -> f
                 }
             }
             SyntaxKind::IfBlock => {
-                if let Some(conditional) = ast::IfBlock::cast(child) {
-                    block
-                        .conditionals
-                        .push(project_spice_conditional(&conditional));
+                if let Some(conditional) = ast::IfBlock::cast(child.clone()) {
+                    block.conditionals.push(project_spice_conditional(
+                        &conditional,
+                        &scope,
+                        errors,
+                    ));
                 }
             }
             _ => {
-                if let Some(dev) = project_spice_device(child) {
+                if let Some(dev) = project_spice_device(child.clone(), &scope) {
                     block.devices.push(dev);
                 }
             }
         }
     }
+    if definition_level {
+        block.params = checked_source_order(block.params, errors);
+    }
     block
 }
 
 /// Project a `SPICENetlistSource` node into a `SpiceBlock`.
-fn project_spice_block(node: SyntaxNode) -> ffi::SpiceBlock {
-    project_spice_block_children(node.children())
+fn project_spice_block(
+    node: SyntaxNode,
+    inherited: &HashSet<String>,
+    errors: &mut Vec<ffi::ParseError>,
+) -> ffi::SpiceBlock {
+    project_spice_block_children(node.children(), inherited, errors, true)
 }
 
 /// The definition-level content shared by a netlist and a subckt body.
@@ -880,48 +1499,147 @@ struct Scope {
     functions: Vec<ffi::FunctionDef>,
 }
 
-fn collect_scope(stmts: impl Iterator<Item = SyntaxNode>) -> Scope {
-    let mut scope = Scope::default();
+/// Resolve a definition-level Spectre `include` statement against the graph,
+/// returning the included file's node key when the graph knows it. The parser
+/// matches the statement's literal `path`/`section` against the root node's
+/// edges (the same spelling the consumer recorded), never re-resolving a path.
+fn graph_root_include_target<'a>(stmt: &SyntaxNode, graph: &'a IncludeGraph) -> Option<&'a str> {
+    if stmt.kind() != SyntaxKind::Include {
+        return None;
+    }
+    let inc = sast::Include::cast(stmt.clone())?;
+    let path = unquote(&tok_text(inc.path()));
+    let section = inc
+        .section()
+        .and_then(|s| s.id())
+        .map(|t| t.text().to_string())
+        .unwrap_or_default();
+    graph.resolve_root_include(&path, &section)
+}
+
+/// Collect one Spectre scope's statements into a `Scope`.
+///
+/// CLAUSE-GATED PARAMETERS ARE NOT OURS TO SORT OR TO REJECT. `order` selects
+/// whether this scope's unconditional parameter list is fed to `order_params`:
+/// it is `true` at a *definition level* (a netlist, a `.subckt` body, a `.lib`
+/// section), where the static `parameters` list is meant to be dependency
+/// sorted and where a true cycle is a real error that must surface; it is
+/// `false` inside a conditional clause body. A clause's names are gated by that
+/// clause, and the consumer resolves such namespaces itself, evaluating only
+/// the *active* clauses — so a cycle between two names defined in an unselected
+/// clause is not an error, and the FFI `errors` channel is a bare span that
+/// cannot say "not really an error". Reporting one here would make a perfectly
+/// loadable deck unloadable. Clause-body parameters therefore stay in source
+/// order, untouched by `order_params`.
+///
+/// CLAUSE-GATED `temp` IS CANONICALIZED, NOT SHADOWED. `clause_gated` marks a
+/// conditional clause body. Such a declaration is gated by its clause, so it
+/// cannot hide the ambient-temperature builtin from the rewrite: only
+/// definition-level declarations (a this-scope `parameters`, an inherited name,
+/// or a definition-level include's declaration) do. Everything declared inside a
+/// clause — locally or by a clause-level include — is therefore kept out of the
+/// shadowing set, and a clause-gated `temp` declaration is emitted as `$temp`
+/// with its references rewritten to `$temp` exactly as if it were undeclared.
+/// At run time the active clause's `$temp` shadows the ambient option and an
+/// inactive clause leaves the ambient option visible — the fallback the
+/// flat inherited set could not express. (Spectre-only: SPICE `temper`
+/// handling is unchanged.)
+///
+/// `graph` carries the consumer-resolved include closure. A definition-level
+/// `include` statement contributes the included file's *unconditional* names to
+/// this scope (following nested definition-level includes through the graph); a
+/// clause-level `include` contributes nothing to the shadowing set, because its
+/// declarations are clause-gated too. The parser walks its own `include`
+/// statements, so a subcircuit that includes nothing never sees a sibling's
+/// include declarations.
+fn collect_scope(
+    stmts: impl Iterator<Item = SyntaxNode>,
+    inherited: &HashSet<String>,
+    graph: &IncludeGraph,
+    errors: &mut Vec<ffi::ParseError>,
+    order: bool,
+    clause_gated: bool,
+) -> Scope {
+    let stmts: Vec<SyntaxNode> = stmts.collect();
+
+    // Visible parameter names. A definition-level `parameters` and a
+    // definition-level include's unconditional names shadow the builtin for
+    // every expression in this scope; clause-gated declarations never do.
+    let mut scope_names = inherited.clone();
+    if !clause_gated {
+        for stmt in &stmts {
+            if stmt.kind() == SyntaxKind::Parameters {
+                if let Some(p) = sast::Parameters::cast(stmt.clone()) {
+                    for prm in p.params() {
+                        if let Some(t) = prm.name() {
+                            scope_names.insert(t.text().to_string());
+                        }
+                    }
+                }
+            }
+        }
+        for stmt in &stmts {
+            if let Some(target) = graph_root_include_target(stmt, graph) {
+                let mut visited = HashSet::new();
+                graph.add_unconditional_closure(target, &mut visited, &mut scope_names);
+            }
+        }
+    }
+    let scope = &scope_names;
+
+    let mut collected = Scope::default();
     for stmt in stmts {
         match stmt.kind() {
             SyntaxKind::Model => {
                 if let Some(m) = sast::Model::cast(stmt) {
-                    scope.models.push(project_model(&m));
+                    collected.models.push(project_model(&m, scope));
                 }
             }
             SyntaxKind::Instance => {
                 if let Some(i) = sast::Instance::cast(stmt) {
-                    scope.instances.push(project_instance(&i));
+                    collected.instances.push(project_instance(&i, scope));
                 }
             }
             SyntaxKind::Subckt => {
                 if let Some(s) = sast::Subckt::cast(stmt) {
-                    scope.subckts.push(project_subckt(&s));
+                    collected
+                        .subckts
+                        .push(project_subckt(&s, scope, graph, errors));
                 }
             }
             SyntaxKind::FunctionDecl => {
                 if let Some(f) = sast::FunctionDecl::cast(stmt) {
-                    scope.functions.push(project_function(&f));
+                    collected.functions.push(project_function(&f, scope));
                 }
             }
             SyntaxKind::Parameters => {
                 if let Some(p) = sast::Parameters::cast(stmt) {
-                    scope.params.extend(p.params().map(|p| project_param(&p)));
+                    collected.params.extend(p.params().map(|p| {
+                        if clause_gated {
+                            project_param_clause_gated(&p, scope)
+                        } else {
+                            project_param(&p, scope)
+                        }
+                    }));
                 }
             }
+            // Conditionals are projected with the definition's full scope,
+            // which already includes their own parameter declarations.
             SyntaxKind::ConditionalBlock => {
                 if let Some(c) = sast::ConditionalBlock::cast(stmt) {
-                    scope.conditionals.push(project_conditional(&c));
+                    collected
+                        .conditionals
+                        .push(project_conditional(&c, scope, graph, errors));
                 }
             }
             SyntaxKind::Analysis => {
                 if let Some(a) = sast::Analysis::cast(stmt) {
-                    scope.analyses.push(project_analysis(&a));
+                    collected.analyses.push(project_analysis(&a, scope));
                 }
             }
             SyntaxKind::Save => {
                 if let Some(s) = sast::Save::cast(stmt) {
-                    scope.saves.extend(s.signals().map(|sig| ffi::SaveItem {
+                    collected.saves.extend(s.signals().map(|sig| ffi::SaveItem {
                         signal: sig.node().map(|n| n.path()).unwrap_or_default(),
                         modifier: sig.modifier().and_then(|m| m.value()).unwrap_or_default(),
                     }));
@@ -929,20 +1647,22 @@ fn collect_scope(stmts: impl Iterator<Item = SyntaxNode>) -> Scope {
             }
             SyntaxKind::Ic => {
                 if let Some(ic) = sast::Ic::cast(stmt) {
-                    scope.ics.extend(ic.params().map(|p| ffi::IcItem {
+                    collected.ics.extend(ic.params().map(|p| ffi::IcItem {
                         node: p.node().map(|n| n.path()).unwrap_or_default(),
-                        value: p.value_text().unwrap_or_default(),
+                        // Every projected expression is normalized, IC values
+                        // included.
+                        value: rewrite_temp(&p.value_text().unwrap_or_default(), false, scope),
                     }));
                 }
             }
             SyntaxKind::Global => {
                 if let Some(g) = sast::Global::cast(stmt) {
-                    scope.globals.extend(g.nodes().map(|n| n.path()));
+                    collected.globals.extend(g.nodes().map(|n| n.path()));
                 }
             }
             SyntaxKind::Include => {
                 if let Some(inc) = sast::Include::cast(stmt) {
-                    scope.includes.push(ffi::Include {
+                    collected.includes.push(ffi::Include {
                         path: unquote(&tok_text(inc.path())),
                         section: inc
                             .section()
@@ -954,16 +1674,23 @@ fn collect_scope(stmts: impl Iterator<Item = SyntaxNode>) -> Scope {
             }
             SyntaxKind::AHDLInclude => {
                 if let Some(a) = sast::AHDLInclude::cast(stmt) {
-                    scope.ahdl_includes.push(unquote(&tok_text(a.path())));
+                    collected.ahdl_includes.push(unquote(&tok_text(a.path())));
                 }
             }
             SyntaxKind::SPICENetlistSource => {
-                scope.spice_blocks.push(project_spice_block(stmt));
+                let mut inner = Vec::new();
+                collected
+                    .spice_blocks
+                    .push(project_spice_block(stmt, scope, &mut inner));
+                errors.extend(inner);
             }
             _ => {}
         }
     }
-    scope
+    if order {
+        collected.params = ordered(collected.params, errors);
+    }
+    collected
 }
 
 fn collect_errors(root: &SyntaxNode) -> Vec<ffi::ParseError> {
@@ -1008,6 +1735,134 @@ fn resolve_lang(name: &str) -> Option<Lang> {
         "xyce" => Some(Lang::Spice(Dialect::Xyce)),
         "spectre" => Some(Lang::Spectre),
         _ => None,
+    }
+}
+
+/// Normalize a parameter name to the dialect's lookup key: SPICE identifiers are
+/// case-folded (its `temper` match is case-insensitive), Spectre identifiers are
+/// kept verbatim (Spectre is case-sensitive). This is the same rule
+/// `rewrite_temp` applies when it looks a name up.
+fn dialect_key(name: &str, spice: bool) -> String {
+    if spice {
+        name.to_ascii_lowercase()
+    } else {
+        name.to_string()
+    }
+}
+
+/// One resolved `include` statement of a graph file.
+struct GraphEdge {
+    path: String,
+    section: String,
+    target: String,
+    /// The statement sits inside a conditional clause body, so the declarations
+    /// it brings into the scope are clause-gated.
+    gated: bool,
+}
+
+/// One resolved file in the graph.
+struct GraphNode {
+    /// Definition-level (unconditional) parameter names, dialect-normalized.
+    unconditional: Vec<String>,
+    includes: Vec<GraphEdge>,
+}
+
+/// The consumer-supplied include graph, normalized for the projection.
+struct IncludeGraph {
+    /// Key of the file being projected; empty disables the graph.
+    root: String,
+    /// Names visible where the projected file is merged, dialect-normalized.
+    inherited: Vec<String>,
+    nodes: HashMap<String, GraphNode>,
+}
+
+impl IncludeGraph {
+    /// The plain projection: no graph, no inherited names.
+    fn empty() -> ffi::IncludeGraph {
+        ffi::IncludeGraph {
+            root: String::new(),
+            inherited: vec![],
+            nodes: vec![],
+        }
+    }
+
+    /// Normalize a caller-supplied `ffi::IncludeGraph` for the dialect.
+    fn from_ffi(graph: ffi::IncludeGraph, spice: bool) -> IncludeGraph {
+        let mut nodes = HashMap::with_capacity(graph.nodes.len());
+        for node in graph.nodes {
+            // `node.conditional` is deliberately not retained: a clause-gated
+            // declaration never shadows the temperature builtin, so only the
+            // unconditional set feeds the projection. The field stays in the
+            // bridge so the consumer states the distinction explicitly.
+            let _conditional = node.conditional;
+            let entry = GraphNode {
+                unconditional: node
+                    .unconditional
+                    .iter()
+                    .map(|n| dialect_key(n, spice))
+                    .collect(),
+                includes: node
+                    .includes
+                    .iter()
+                    .map(|e| GraphEdge {
+                        path: e.path.clone(),
+                        section: e.section.clone(),
+                        target: e.target.clone(),
+                        gated: e.gated,
+                    })
+                    .collect(),
+            };
+            nodes.insert(node.key, entry);
+        }
+        IncludeGraph {
+            root: graph.root,
+            inherited: graph
+                .inherited
+                .iter()
+                .map(|n| dialect_key(n, spice))
+                .collect(),
+            nodes,
+        }
+    }
+
+    /// Resolve an `include` statement written as (`path`, `section`) inside the
+    /// root file to its target node key. The root file's own statements are
+    /// matched against the root node's `includes`; nested edges are followed by
+    /// key, never by re-matching paths.
+    fn resolve_root_include(&self, path: &str, section: &str) -> Option<&str> {
+        let root = self.nodes.get(&self.root)?;
+        root.includes
+            .iter()
+            .find(|e| e.path == path && e.section == section)
+            .map(|e| e.target.as_str())
+    }
+
+    /// Add every name that the include of `target` makes *unconditionally*
+    /// visible to an including scope: `target`'s own definition-level names
+    /// plus, recursively, the names its definition-level (`gated == false`)
+    /// includes make visible. Clause-gated edges contribute nothing here — their
+    /// declarations never shadow the temperature builtin. `visited` breaks
+    /// include cycles.
+    fn add_unconditional_closure(
+        &self,
+        target: &str,
+        visited: &mut HashSet<String>,
+        out: &mut HashSet<String>,
+    ) {
+        if !visited.insert(target.to_string()) {
+            return;
+        }
+        let Some(node) = self.nodes.get(target) else {
+            return;
+        };
+        for name in &node.unconditional {
+            out.insert(name.clone());
+        }
+        for edge in &node.includes {
+            if !edge.gated {
+                self.add_unconditional_closure(&edge.target, visited, out);
+            }
+        }
     }
 }
 
@@ -1067,6 +1922,24 @@ fn netlist_from_scope(
 }
 
 pub fn parse_netlist(src: &str, language: &str) -> ffi::Netlist {
+    parse_netlist_with_includes(src, language, IncludeGraph::empty())
+}
+
+/// Parse `src` with a consumer-resolved `graph` of the include closure. The
+/// parser reads no files: the consumer resolves includes and hands over, per
+/// file, the names the file declares (separating definition-level from
+/// clause-gated declarations) and the file's own nested includes. The parser
+/// then walks its OWN `include` statements and applies each included file's
+/// declarations in the scope where that statement sits — clause-gated when the
+/// statement itself sits inside a clause — following nested includes through the
+/// graph. `graph.inherited` carries the names visible where `src` is merged, so
+/// a reference in an *included* file sees a sibling include's declaration. An
+/// empty graph is exactly `parse_netlist`.
+pub fn parse_netlist_with_includes(
+    src: &str,
+    language: &str,
+    graph: ffi::IncludeGraph,
+) -> ffi::Netlist {
     let (start_lang, dialect) = match resolve_lang(language) {
         // Spectre start: dialect is only consulted if a `simulator lang=spice`
         // region appears; Ngspice is the harmless default there.
@@ -1074,11 +1947,20 @@ pub fn parse_netlist(src: &str, language: &str) -> ffi::Netlist {
         Some(Lang::Spice(d)) => (StartLang::Spice, d),
         None => return lang_error_netlist(),
     };
+    let graph = IncludeGraph::from_ffi(graph, matches!(start_lang, StartLang::Spice));
+    let inherited: HashSet<String> = graph.inherited.iter().cloned().collect();
     let root = parse_spectre_with(src, start_lang, dialect);
-    let errors = collect_errors(&root);
+    let mut errors = collect_errors(&root);
     let incompletes = collect_incompletes(&root);
     let source = sast::SpectreNetlistSource::cast(root).expect("root is SpectreNetlistSource");
-    let scope = collect_scope(source.statements());
+    let scope = collect_scope(
+        source.statements(),
+        &inherited,
+        &graph,
+        &mut errors,
+        true,
+        false,
+    );
     netlist_from_scope(scope, errors, incompletes)
 }
 
@@ -1088,16 +1970,39 @@ pub fn parse_netlist(src: &str, language: &str) -> ffi::Netlist {
 /// (Spectre has no separate block type), so a consumer merges them into the
 /// current scope exactly as it would a flat Spectre netlist.
 pub fn parse_netlist_lib(src: &str, section: &str, language: &str) -> ffi::Netlist {
+    parse_netlist_lib_with_includes(src, section, language, IncludeGraph::empty())
+}
+
+/// Like `parse_netlist_lib`, with an include `graph` visible to the
+/// temperature-builtin shadowing (see `parse_netlist_with_includes`).
+pub fn parse_netlist_lib_with_includes(
+    src: &str,
+    section: &str,
+    language: &str,
+    graph: ffi::IncludeGraph,
+) -> ffi::Netlist {
     match resolve_lang(language) {
-        Some(Lang::Spice(dialect)) => parse_spice_lib(src, section, dialect),
-        Some(Lang::Spectre) => parse_spectre_lib(src, section),
+        Some(Lang::Spice(dialect)) => {
+            let graph = IncludeGraph::from_ffi(graph, true);
+            let inherited: HashSet<String> = graph.inherited.into_iter().collect();
+            parse_spice_lib(src, section, dialect, &inherited)
+        }
+        Some(Lang::Spectre) => {
+            let graph = IncludeGraph::from_ffi(graph, false);
+            parse_spectre_lib(src, section, &graph)
+        }
         None => lang_error_netlist(),
     }
 }
 
-fn parse_spice_lib(src: &str, section: &str, dialect: Dialect) -> ffi::Netlist {
+fn parse_spice_lib(
+    src: &str,
+    section: &str,
+    dialect: Dialect,
+    inherited: &HashSet<String>,
+) -> ffi::Netlist {
     let root = parse_spice_dialect(src, dialect);
-    let errors = collect_errors(&root);
+    let mut errors = collect_errors(&root);
     let incompletes = collect_incompletes(&root);
 
     let mut block = ffi::SpiceBlock {
@@ -1113,7 +2018,12 @@ fn parse_spice_lib(src: &str, section: &str, dialect: Dialect) -> ffi::Netlist {
             if let Some(lib) = ast::LibStatement::cast(child) {
                 let name = tok_text(lib.name());
                 if name.eq_ignore_ascii_case(section) {
-                    let inner = project_spice_block_children(lib.statements());
+                    let inner = project_spice_block_children(
+                        lib.statements(),
+                        inherited,
+                        &mut errors,
+                        true,
+                    );
                     block.params.extend(inner.params);
                     block.models.extend(inner.models);
                     block.subckts.extend(inner.subckts);
@@ -1124,7 +2034,8 @@ fn parse_spice_lib(src: &str, section: &str, dialect: Dialect) -> ffi::Netlist {
             }
         }
     }
-
+    // The selected section's `.param`s were already analysed at definition
+    // level inside `project_spice_block_children`; they are never reordered.
     let mut nl = empty_netlist();
     nl.spice_blocks.push(block);
     nl.errors = errors;
@@ -1140,9 +2051,9 @@ fn spectre_section_matches(sec: &sast::Section, wanted: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn parse_spectre_lib(src: &str, section: &str) -> ffi::Netlist {
+fn parse_spectre_lib(src: &str, section: &str, graph: &IncludeGraph) -> ffi::Netlist {
     let root = parse_spectre_with(src, StartLang::Spectre, Dialect::Ngspice);
-    let errors = collect_errors(&root);
+    let mut errors = collect_errors(&root);
     let incompletes = collect_incompletes(&root);
     let source = sast::SpectreNetlistSource::cast(root).expect("root is SpectreNetlistSource");
 
@@ -1171,13 +2082,70 @@ fn parse_spectre_lib(src: &str, section: &str) -> ffi::Netlist {
         }
     }
 
-    let scope = collect_scope(selected.into_iter());
+    let inherited: HashSet<String> = graph.inherited.iter().cloned().collect();
+    let scope = collect_scope(
+        selected.into_iter(),
+        &inherited,
+        graph,
+        &mut errors,
+        true,
+        false,
+    );
     netlist_from_scope(scope, errors, incompletes)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_netlist, parse_netlist_lib};
+    use super::{
+        parse_netlist, parse_netlist_lib, parse_netlist_lib_with_includes,
+        parse_netlist_with_includes,
+    };
+    use crate::ffi;
+
+    /// A graph node with definition-level (`uncond`) names only.
+    fn node(key: &str, uncond: &[&str]) -> ffi::IncludeNode {
+        ffi::IncludeNode {
+            key: key.to_string(),
+            unconditional: uncond.iter().map(|s| s.to_string()).collect(),
+            conditional: vec![],
+            includes: vec![],
+        }
+    }
+
+    /// A graph node whose declared names are all clause-gated.
+    fn node_gated(key: &str, cond: &[&str]) -> ffi::IncludeNode {
+        ffi::IncludeNode {
+            key: key.to_string(),
+            unconditional: vec![],
+            conditional: cond.iter().map(|s| s.to_string()).collect(),
+            includes: vec![],
+        }
+    }
+
+    /// Attach this file's own `include` statements to a node.
+    fn with_includes(
+        mut n: ffi::IncludeNode,
+        edges: &[(&str, &str, &str, bool)],
+    ) -> ffi::IncludeNode {
+        n.includes = edges
+            .iter()
+            .map(|(path, section, target, gated)| ffi::IncludeEdge {
+                path: path.to_string(),
+                section: section.to_string(),
+                target: target.to_string(),
+                gated: *gated,
+            })
+            .collect();
+        n
+    }
+
+    fn graph(root: &str, inherited: &[&str], nodes: Vec<ffi::IncludeNode>) -> ffi::IncludeGraph {
+        ffi::IncludeGraph {
+            root: root.to_string(),
+            inherited: inherited.iter().map(|s| s.to_string()).collect(),
+            nodes,
+        }
+    }
 
     #[test]
     fn projects_spice_scoped_includes_and_nested_conditionals() {
@@ -1839,5 +2807,1117 @@ ends adnfet\n";
             nl.includes.is_empty(),
             "subckt include must not leak to top level"
         );
+    }
+
+    // --- Change 1: dialect temperature builtins ---
+
+    #[test]
+    fn rewrites_spectre_temp_builtin_in_parameters() {
+        // A free `temp` becomes `$temp`; a call name that merely starts with
+        // `temp` is not touched, but a `temp` argument to another call is.
+        let nl = parse_netlist(
+            "simulator lang=spectre\nparameters tp=temp+25 rate=tempo(temp)\n",
+            "spectre",
+        );
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        let val = |name: &str| {
+            nl.params
+                .iter()
+                .find(|p| p.name == name)
+                .map(|p| p.value.clone())
+                .unwrap()
+        };
+        assert_eq!(val("tp"), "$temp+25");
+        assert_eq!(val("rate"), "tempo($temp)");
+    }
+
+    #[test]
+    fn declared_spectre_parameter_shadows_temp() {
+        let nl = parse_netlist(
+            "simulator lang=spectre\nparameters temp=300 vt=P_K*temp/P_Q\n",
+            "spectre",
+        );
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        // `temp` is declared, so it keeps its binding everywhere in the scope.
+        let tmp = nl.params.iter().find(|p| p.name == "temp").unwrap();
+        assert_eq!(tmp.value, "300");
+        let vt = nl.params.iter().find(|p| p.name == "vt").unwrap();
+        assert_eq!(vt.value, "P_K*temp/P_Q");
+        // Ordering must place `temp` before `vt` (which references it).
+        assert_eq!(
+            nl.params
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["temp", "vt"]
+        );
+    }
+
+    #[test]
+    fn spectre_temp_inside_access_or_string_is_untouched() {
+        // `temp` inside v()/i() names a node/branch; inside quotes it is a
+        // string literal. Neither is a free identifier.
+        let nl = parse_netlist(
+            "simulator lang=spectre\nparameters p1=v(temp) p2=i(temp) s=\"temp\"\n",
+            "spectre",
+        );
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        let val = |name: &str| {
+            nl.params
+                .iter()
+                .find(|p| p.name == name)
+                .map(|p| p.value.clone())
+                .unwrap()
+        };
+        assert_eq!(val("p1"), "v(temp)");
+        assert_eq!(val("p2"), "i(temp)");
+        assert_eq!(val("s"), "\"temp\"");
+    }
+
+    #[test]
+    fn spectre_temp_call_name_is_not_rewritten() {
+        let nl = parse_netlist("simulator lang=spectre\nparameters c=temp(1)\n", "spectre");
+        // The call name itself is a function, not the ambient-temperature builtin.
+        let c = nl.params.iter().find(|p| p.name == "c").unwrap();
+        assert_eq!(c.value, "temp(1)");
+    }
+
+    #[test]
+    fn spectre_temp_conditional_declaration_is_canonicalized_not_shadowed() {
+        // A `temp` declared in a conditional clause is gated by that clause, so
+        // it must NOT hide the builtin from the rewrite: the declared NAME is
+        // emitted as `$temp`, and a free `temp` elsewhere in the definition
+        // becomes `$temp`. The active clause's `$temp` shadows the ambient
+        // option; an inactive clause leaves the ambient option visible.
+        let nl = parse_netlist(
+            "simulator lang=spectre\n\
+             parameters y=temp\n\
+             if (1) {\n\
+             parameters temp=1\n\
+             }\n",
+            "spectre",
+        );
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        let y = nl.params.iter().find(|p| p.name == "y").unwrap();
+        assert_eq!(y.value, "$temp", "clause-gated declaration must not shadow");
+        assert_eq!(
+            nl.conditionals[0].clauses[0].body.params[0].name, "$temp",
+            "the clause-gated declaration is emitted as `$temp`"
+        );
+        assert_eq!(nl.conditionals[0].clauses[0].body.params[0].value, "1");
+    }
+
+    #[test]
+    fn spectre_conditional_condition_is_rewritten() {
+        let nl = parse_netlist(
+            "simulator lang=spectre\n\
+             parameters x=1\n\
+             if (temp > 0) {\n\
+             r1 (a b) resistor r=1k\n\
+             }\n",
+            "spectre",
+        );
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        assert_eq!(nl.conditionals[0].clauses[0].condition, "$temp > 0");
+    }
+
+    #[test]
+    fn spectre_function_bodies_are_rewritten_with_arg_scope() {
+        let nl = parse_netlist(
+            "simulator lang=spectre\n\
+             real f(real a) {\n\
+             return a*temp ;\n\
+             }\n\
+             real g(real temp) {\n\
+             return temp*2 ;\n\
+             }\n",
+            "spectre",
+        );
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        let f = nl.functions.iter().find(|f| f.name == "f").unwrap();
+        assert_eq!(f.body, "a*$temp");
+        let g = nl.functions.iter().find(|f| f.name == "g").unwrap();
+        assert_eq!(g.body, "temp*2", "a `temp` argument keeps its binding");
+    }
+
+    #[test]
+    fn rewrite_temp_in_instance_and_model_params() {
+        let nl = parse_netlist(
+            "simulator lang=spectre\n\
+             model nch bsim4 tnom=temp\n\
+             x1 (a b) nch w=temp\n",
+            "spectre",
+        );
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        assert_eq!(nl.models[0].params[0].value, "$temp");
+        assert_eq!(nl.instances[0].params[0].value, "$temp");
+    }
+
+    #[test]
+    fn rewrites_spectre_temper_not_at_all() {
+        // Spectre's builtin is `temp`; `temper` is an ordinary identifier there.
+        let nl = parse_netlist("simulator lang=spectre\nparameters x=temper\n", "spectre");
+        assert_eq!(nl.params[0].value, "temper");
+    }
+
+    #[test]
+    fn rewrites_spice_temper_builtin() {
+        let nl = parse_netlist("* t\n.param tp=temper\nR1 a b tp\n", "ngspice");
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        let b = &nl.spice_blocks[0];
+        assert_eq!(b.params[0].name, "tp");
+        assert_eq!(b.params[0].value, "$temp");
+    }
+
+    #[test]
+    fn declared_spice_parameter_shadows_temper() {
+        let nl = parse_netlist(
+            "* t\n.param temper=27\n.param tp=temper\nR1 a b tp\n",
+            "ngspice",
+        );
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        let b = &nl.spice_blocks[0];
+        let tp = b.params.iter().find(|p| p.name == "tp").unwrap();
+        assert_eq!(tp.value, "temper", "declared `temper` keeps its binding");
+    }
+
+    #[test]
+    fn spice_native_temp_is_left_alone() {
+        // `temp` is not the SPICE builtin (that is `temper`) and only the SPECTRE
+        // dialect rewrites `temp`.
+        let nl = parse_netlist("* t\n.param t=temp\nR1 a b t\n", "ngspice");
+        let b = &nl.spice_blocks[0];
+        assert_eq!(b.params[0].value, "temp");
+    }
+
+    #[test]
+    fn spice_temper_in_device_and_model_params() {
+        let nl = parse_netlist(
+            "* t\nR1 a b 1k tc1=temper\n.model dm d is=temper\n",
+            "ngspice",
+        );
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        let b = &nl.spice_blocks[0];
+        assert_eq!(b.devices[0].params[0].value, "$temp");
+        assert_eq!(b.models[0].params[0].value, "$temp");
+    }
+
+    // --- Change 2: dependency-ordered parameter lists ---
+
+    #[test]
+    fn spectre_parameters_are_dependency_ordered() {
+        // `b` is declared before `a` but references it: ordering resolves the
+        // forward reference without touching the values.
+        let nl = parse_netlist("simulator lang=spectre\nparameters b=a*2 a=1\n", "spectre");
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        assert_eq!(
+            nl.params
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+    }
+
+    #[test]
+    fn spectre_independent_parameters_keep_source_order() {
+        let nl = parse_netlist(
+            "simulator lang=spectre\nparameters a=1 b=2 c=3\n",
+            "spectre",
+        );
+        assert_eq!(
+            nl.params
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
+    }
+
+    #[test]
+    fn spectre_self_reference_is_not_a_cycle() {
+        // `x=x+1` denotes the enclosing scope: no edge, so this is not a cycle
+        // and `x` is still ordered before `y`.
+        let nl = parse_netlist(
+            "simulator lang=spectre\nparameters y=x*2 x=x+1\n",
+            "spectre",
+        );
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        assert_eq!(
+            nl.params
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["x", "y"]
+        );
+        let x = nl.params.iter().find(|p| p.name == "x").unwrap();
+        assert_eq!(x.value, "x+1");
+    }
+
+    #[test]
+    fn spectre_parameter_cycle_is_reported() {
+        let nl = parse_netlist("simulator lang=spectre\nparameters a=b b=a\n", "spectre");
+        assert!(
+            !nl.errors.is_empty(),
+            "a parameter cycle must surface through the FFI errors field"
+        );
+        // Parameters are kept (in source order), not dropped.
+        assert_eq!(
+            nl.params
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+    }
+
+    #[test]
+    fn spice_forward_reference_list_stays_in_source_order() {
+        // Dependency ordering is Spectre-only: a SPICE forward reference is
+        // left exactly where it was written, and is not an error.
+        let nl = parse_netlist("* t\n.param b=a*2\n.param a=1\nR1 x y b\n", "ngspice");
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        let b = &nl.spice_blocks[0];
+        assert_eq!(
+            b.params.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            ["b", "a"]
+        );
+    }
+
+    #[test]
+    fn spice_subckt_parameters_keep_source_order() {
+        let nl = parse_netlist(
+            "* t\n.subckt rcblock a b w=1u l=2u\n.param rint=3k\n.param cint=1p\nR1 a b rint\n.ends\n",
+            "ngspice",
+        );
+        let s = &nl.spice_blocks[0].subckts[0];
+        // Source order (header first, then body): SPICE lists are not sorted.
+        assert_eq!(
+            s.params.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            ["w", "l", "rint", "cint"]
+        );
+    }
+
+    // --- Consumer-supplied include graph (per-scope shadowing) ---
+
+    #[test]
+    fn spectre_inherited_temp_shadows_builtin() {
+        // Names already visible where the projected file is merged suppress the
+        // rewrite. With an empty graph the free `temp` is the builtin.
+        let enclosing = "simulator lang=spectre\nparameters y=temp+1\n";
+        let alone = parse_netlist(enclosing, "spectre");
+        let y = alone.params.iter().find(|p| p.name == "y").unwrap();
+        assert_eq!(y.value, "$temp+1", "empty graph rewrites to builtin");
+
+        let inherited =
+            parse_netlist_with_includes(enclosing, "spectre", graph("f", &["temp"], vec![]));
+        let y = inherited.params.iter().find(|p| p.name == "y").unwrap();
+        assert_eq!(y.value, "temp+1", "inherited `temp` shadows the builtin");
+    }
+
+    #[test]
+    fn spectre_inherited_names_are_case_sensitive() {
+        // Spectre identifiers are case-sensitive: an inherited `TEMP` must not
+        // shadow the lowercase builtin `temp`.
+        let nl = parse_netlist_with_includes(
+            "simulator lang=spectre\nparameters y=temp\n",
+            "spectre",
+            graph("f", &["TEMP"], vec![]),
+        );
+        assert_eq!(nl.params[0].value, "$temp");
+    }
+
+    #[test]
+    fn spectre_inherited_combines_with_local_declaration() {
+        // Inherited `temp` plus a locally declared `k` are both preserved in
+        // the same expression (the visible scope is their union).
+        let nl = parse_netlist_with_includes(
+            "simulator lang=spectre\nparameters k=2 y=temp+k\n",
+            "spectre",
+            graph("f", &["temp"], vec![]),
+        );
+        let y = nl.params.iter().find(|p| p.name == "y").unwrap();
+        assert_eq!(y.value, "temp+k");
+    }
+
+    #[test]
+    fn spectre_inherited_combines_with_conditional_declaration() {
+        // A `temp` declared in a conditional clause never shadows; an unrelated
+        // inherited name (`a`) is honoured at the same time, so `temp` becomes
+        // `$temp` while `a` keeps its binding.
+        let nl = parse_netlist_with_includes(
+            "simulator lang=spectre\n\
+             parameters y=temp+a\n\
+             if (1) {\n\
+             parameters temp=1\n\
+             }\n",
+            "spectre",
+            graph("f", &["a"], vec![]),
+        );
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        let y = nl.params.iter().find(|p| p.name == "y").unwrap();
+        assert_eq!(y.value, "$temp+a");
+    }
+
+    #[test]
+    fn spice_inherited_temper_shadows_builtin_case_folded() {
+        // SPICE equivalent: an inherited name suppresses the `temper` rewrite.
+        // The inherited name is case-folded, so its casing does not matter.
+        let enclosing = "* t\n.param tp=temper\nR1 a b tp\n";
+        let alone = parse_netlist(enclosing, "ngspice");
+        assert_eq!(alone.spice_blocks[0].params[0].value, "$temp");
+
+        let inherited =
+            parse_netlist_with_includes(enclosing, "ngspice", graph("f", &["TEMPER"], vec![]));
+        let tp = inherited.spice_blocks[0]
+            .params
+            .iter()
+            .find(|p| p.name == "tp")
+            .unwrap();
+        assert_eq!(tp.value, "temper", "inherited `temper` shadows the builtin");
+    }
+
+    #[test]
+    fn lib_entry_point_accepts_include_graph() {
+        // The `.lib` entry point threads the graph's inherited names as well.
+        let src = "\
+simulator lang=spectre\n\
+library global\n\
+section tt\n\
+parameters y=temp\n\
+endsection tt\n\
+endlibrary global\n";
+        let alone = parse_netlist_lib(src, "tt", "spectre");
+        assert_eq!(alone.params[0].value, "$temp");
+
+        let inherited =
+            parse_netlist_lib_with_includes(src, "tt", "spectre", graph("f", &["temp"], vec![]));
+        assert_eq!(inherited.params[0].value, "temp");
+    }
+
+    // --- The v1..v11 matrix: conditional/included temperature declarations ---
+
+    /// The consumer's `spectre_temp_cond_scope.scs`, reproduced verbatim.
+    const COND_SCOPE_SRC: &str = "\
+simulator lang=spectre
+
+model resistor resistor
+model vsource vsource
+
+subckt nested_cond_temp a b
+  parameters sel=1 innerSel=1
+  if (sel==1) {
+    if (innerSel==1) {
+      parameters temp=50
+    }
+    parameters rval=temp*10
+  } else {
+    parameters rval=temp*10
+  }
+  r1 (a b) resistor r=rval
+ends nested_cond_temp
+
+subckt root_ref_temp a b
+  parameters sel=1 rval=temp*10
+  if (sel==1) {
+    parameters temp=50
+  }
+  r1 (a b) resistor r=rval
+ends root_ref_temp
+
+subckt included_cond_temp a b
+  parameters sel=1
+  if (sel==1) {
+    include \"spectre_temp_cond_decl.scs\"
+    parameters rval=temp*10
+  } else {
+    parameters rval=temp*10
+  }
+  r1 (a b) resistor r=rval
+ends included_cond_temp
+
+subckt later_include_temp a b
+  include \"spectre_temp_later_ref.scs\"
+  include \"spectre_temp_later_decl.scs\"
+  r1 (a b) resistor r=rval
+ends later_include_temp
+
+subckt ambient_temp a b
+  parameters rval=temp*10
+  r1 (a b) resistor r=rval
+ends ambient_temp
+
+subckt first_shared_temp a b
+  include \"spectre_temp_decl.scs\"
+  parameters rval=temp*10
+  r1 (a b) resistor r=rval
+ends first_shared_temp
+
+subckt second_shared_temp a b
+  include \"spectre_temp_decl.scs\"
+  parameters rval=temp*10
+  r1 (a b) resistor r=rval
+ends second_shared_temp
+";
+
+    /// The include graph the consumer resolves for `COND_SCOPE_SRC`: each
+    /// included file's declared names (definition-level vs clause-gated) and the
+    /// edges out of the file being projected.
+    fn cond_scope_graph() -> ffi::IncludeGraph {
+        graph(
+            "scope.scs",
+            &[],
+            vec![
+                with_includes(
+                    node("scope.scs", &[]),
+                    &[
+                        // `included_cond_temp`'s clause-level include.
+                        ("spectre_temp_cond_decl.scs", "", "cond_decl", true),
+                        ("spectre_temp_later_ref.scs", "", "later_ref", false),
+                        ("spectre_temp_later_decl.scs", "", "later_decl", false),
+                        ("spectre_temp_decl.scs", "", "shared_decl", false),
+                    ],
+                ),
+                // cond_decl file: `if (sel==1) { parameters temp=50 }`.
+                node_gated("cond_decl", &["temp"]),
+                // later_ref file: `parameters rval=temp+1`.
+                node("later_ref", &["rval"]),
+                // later_decl file: `parameters temp=100`.
+                node("later_decl", &["temp"]),
+                // shared decl file: `parameters temp=100`.
+                node("shared_decl", &["temp"]),
+            ],
+        )
+    }
+
+    fn val(params: &[ffi::Param], name: &str) -> String {
+        params
+            .iter()
+            .find(|p| p.name == name)
+            .unwrap_or_else(|| panic!("no parameter `{name}`"))
+            .value
+            .clone()
+    }
+
+    #[test]
+    fn spectre_temp_scope_matrix_v1_to_v11() {
+        let nl = parse_netlist_with_includes(COND_SCOPE_SRC, "spectre", cond_scope_graph());
+        assert_eq!(nl.subckts.len(), 7, "the deck must parse");
+        assert!(
+            nl.incompletes.is_empty(),
+            "no content may be dropped: {:?}",
+            nl.incompletes
+                .iter()
+                .map(|e| (e.start, e.end))
+                .collect::<Vec<_>>()
+        );
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        let sub = |name: &str| nl.subckts.iter().find(|s| s.name == name).unwrap();
+
+        // v1/v2/v7 (nested_cond_temp): the active nested clause declares `temp`,
+        // emitted as `$temp`, so `rval=$temp*10` is the ambient temperature when
+        // no clause binds it. Both clause bodies carry the SAME reference text.
+        let nested = sub("nested_cond_temp");
+        assert_eq!(nested.conditionals.len(), 1);
+        let nclauses = &nested.conditionals[0].clauses;
+        assert_eq!(nclauses.len(), 2);
+        // v1 (active, innerSel=1): the inner clause binds `$temp=50`.
+        let inner = &nclauses[0].body.conditionals[0].clauses[0].body;
+        assert_eq!(inner.params[0].name, "$temp");
+        assert_eq!(inner.params[0].value, "50");
+        // The active outer clause's reference.
+        assert_eq!(val(&nclauses[0].body.params, "rval"), "$temp*10");
+        // v2 (outer else): same reference, no `$temp` binding -> ambient.
+        assert_eq!(val(&nclauses[1].body.params, "rval"), "$temp*10");
+
+        // v8/v9 (root_ref_temp): the definition-level reference sees the
+        // clause-gated `temp` only as the ambient `$temp`.
+        let rootref = sub("root_ref_temp");
+        assert_eq!(val(&rootref.params, "rval"), "$temp*10");
+        assert_eq!(
+            rootref.conditionals[0].clauses[0].body.params[0].name,
+            "$temp"
+        );
+        assert_eq!(
+            rootref.conditionals[0].clauses[0].body.params[0].value,
+            "50"
+        );
+
+        // v3/v4 (included_cond_temp): a clause-level include shares the clause
+        // scope; its clause-gated `temp` does not shadow, so both branches
+        // reference the ambient `$temp`.
+        let included = sub("included_cond_temp");
+        let iclauses = &included.conditionals[0].clauses;
+        assert_eq!(iclauses[0].body.includes.len(), 1);
+        assert_eq!(
+            iclauses[0].body.includes[0].path,
+            "spectre_temp_cond_decl.scs"
+        );
+        assert_eq!(val(&iclauses[0].body.params, "rval"), "$temp*10");
+        assert_eq!(val(&iclauses[1].body.params, "rval"), "$temp*10");
+
+        // v5 (later_include_temp): both includes are definition-level; the
+        // declaration file is a SIBLING of the reference file, so the reference
+        // is projected separately with the scope's names (see the dedicated
+        // test below). The subckt itself keeps `r=rval` unrewritten.
+        let later = sub("later_include_temp");
+        assert_eq!(later.includes.len(), 2);
+        assert_eq!(later.instances[0].params[0].value, "rval");
+
+        // v6 (ambient_temp): NO include of its own, so a sibling subcircuit's
+        // include declaration must not leak in: the free `temp` is the ambient
+        // temperature.
+        assert_eq!(val(&sub("ambient_temp").params, "rval"), "$temp*10");
+
+        // v10/v11 (first_/second_shared_temp): each includes the shared file at
+        // definition level, so the declared `temp` shadows the builtin.
+        assert_eq!(val(&sub("first_shared_temp").params, "rval"), "temp*10");
+        assert_eq!(val(&sub("second_shared_temp").params, "rval"), "temp*10");
+    }
+
+    #[test]
+    fn spectre_include_graph_is_applied_per_scope_not_whole_file() {
+        // Two sibling subcircuits in one file: only the one that includes the
+        // declaration file sees its `temp`. The projection is a single pass over
+        // the file, so this is exactly the per-scope scoping the flat list could
+        // not express.
+        let src = "\
+simulator lang=spectre
+subckt with_include a b
+  include \"decl.scs\"
+  parameters rval=temp*10
+  r1 (a b) resistor r=rval
+ends with_include
+subckt without_include a b
+  parameters rval=temp*10
+  r1 (a b) resistor r=rval
+ends without_include
+";
+        let g = graph(
+            "f.scs",
+            &[],
+            vec![
+                with_includes(node("f.scs", &[]), &[("decl.scs", "", "decl", false)]),
+                node("decl", &["temp"]),
+            ],
+        );
+        let nl = parse_netlist_with_includes(src, "spectre", g);
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        let sub = |name: &str| nl.subckts.iter().find(|s| s.name == name).unwrap();
+        assert_eq!(
+            val(&sub("with_include").params, "rval"),
+            "temp*10",
+            "a subcircuit that includes the declaration sees `temp`"
+        );
+        assert_eq!(
+            val(&sub("without_include").params, "rval"),
+            "$temp*10",
+            "a sibling that includes nothing must not see it"
+        );
+    }
+
+    #[test]
+    fn spectre_nested_include_declarations_are_followed_through_the_graph() {
+        // The root includes `mid`, which declares nothing but includes `leaf` at
+        // definition level; `leaf` declares `temp`. The name is visible in the
+        // root's scope, so the root's reference keeps the declared binding.
+        let src = "\
+simulator lang=spectre
+include \"mid.scs\"
+parameters rval=temp*10
+";
+        let g = graph(
+            "f.scs",
+            &[],
+            vec![
+                with_includes(node("f.scs", &[]), &[("mid.scs", "", "mid", false)]),
+                with_includes(node("mid", &[]), &[("leaf.scs", "", "leaf", false)]),
+                node("leaf", &["temp"]),
+            ],
+        );
+        let nl = parse_netlist_with_includes(src, "spectre", g);
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        assert_eq!(val(&nl.params, "rval"), "temp*10");
+    }
+
+    #[test]
+    fn spectre_included_reference_sees_sibling_include_declaration() {
+        // v5: the reference lives in `later_ref.scs`, which itself has no include
+        // statement. The consumer projects it with `inherited = ["temp"]` (the
+        // names the sibling `later_decl.scs` makes visible in the merging scope),
+        // so `rval=temp+1` keeps the declared binding. Without that context the
+        // free `temp` is the ambient builtin.
+        let later_ref = "parameters rval=temp+1\n";
+        let with_scope = parse_netlist_with_includes(
+            later_ref,
+            "spectre",
+            graph("later_ref", &["temp"], vec![node("later_ref", &["rval"])]),
+        );
+        assert_eq!(val(&with_scope.params, "rval"), "temp+1");
+
+        let alone = parse_netlist_with_includes(
+            later_ref,
+            "spectre",
+            graph("later_ref", &[], vec![node("later_ref", &["rval"])]),
+        );
+        assert_eq!(val(&alone.params, "rval"), "$temp+1");
+    }
+
+    #[test]
+    fn spectre_clause_gated_temp_is_canonicalized_in_declaration_and_references() {
+        // A `temp` declared inside a conditional clause is emitted as `$temp`,
+        // and every free `temp` reference in the same clause namespace is
+        // rewritten to `$temp` exactly as if the declaration were absent. There
+        // is no `temp=$temp` double entry: the declaration IS the `$temp`.
+        let src = "\
+simulator lang=spectre
+subckt s a b
+  parameters sel=1
+  if (sel==1) {
+    parameters temp=50
+    parameters rval=temp*10
+  }
+  r1 (a b) resistor r=rval
+ends s
+";
+        let nl = parse_netlist(src, "spectre");
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        let body = &nl.subckts[0].conditionals[0].clauses[0].body;
+        assert_eq!(body.params[0].name, "$temp", "the declaration is `$temp`");
+        assert_eq!(body.params[0].value, "50");
+        assert_eq!(body.params[1].name, "rval");
+        assert_eq!(
+            body.params[1].value, "$temp*10",
+            "the reference in the clause namespace is `$temp` too"
+        );
+    }
+
+    #[test]
+    fn spectre_unconditional_declaration_does_not_shadow_via_clause_gate() {
+        // KEEP UNCHANGED: an UNCONDITIONAL `temp` declaration still suppresses
+        // the rewrite in the whole definition, so nothing becomes `$temp`.
+        let nl = parse_netlist(
+            "simulator lang=spectre\nparameters temp=300 y=temp+1\n",
+            "spectre",
+        );
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        assert_eq!(
+            nl.params.iter().find(|p| p.name == "temp").unwrap().name,
+            "temp"
+        );
+        assert_eq!(val(&nl.params, "y"), "temp+1");
+    }
+
+    // --- Clause-gated parameters must never make a deck unloadable ---
+    #[test]
+    fn spectre_unconditional_forward_reference_is_ordered() {
+        // Definition-level `parameters`: a forward reference is still resolved
+        // into dependency order.
+        let nl = parse_netlist(
+            "simulator lang=spectre\nparameters c=b*2 b=a*2 a=1\n",
+            "spectre",
+        );
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        assert_eq!(
+            nl.params
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
+    }
+
+    #[test]
+    fn spectre_unconditional_forward_cycle_is_reported() {
+        // A forward-referencing cycle among UNCONDITIONAL parameters is a real
+        // error and must still surface through the FFI `errors` field (the
+        // consumer relies on that signal), with the parameters kept.
+        let nl = parse_netlist(
+            "simulator lang=spectre\nparameters b=a*2 a=b*2\n",
+            "spectre",
+        );
+        assert!(
+            !nl.errors.is_empty(),
+            "an unconditional parameter cycle must surface through the FFI errors field"
+        );
+        assert_eq!(
+            nl.params
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["b", "a"]
+        );
+    }
+
+    #[test]
+    fn spectre_subckt_unconditional_cycle_is_reported() {
+        // The same guarantee at `.subckt` scope: definition-level parameters
+        // are ordered and a true cycle is reported.
+        let src = "\
+simulator lang=spectre
+subckt s a b
+parameters x=y*2 y=x*2
+r1 (a b) resistor r=1
+ends s
+";
+        let nl = parse_netlist(src, "spectre");
+        assert_eq!(nl.subckts.len(), 1, "the subckt must parse");
+        assert!(
+            nl.incompletes.is_empty(),
+            "no syntax incomplete: {:?}",
+            nl.incompletes
+                .iter()
+                .map(|e| (e.start, e.end))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !nl.errors.is_empty(),
+            "a subckt unconditional parameter cycle must surface"
+        );
+    }
+
+    #[test]
+    fn spectre_clause_gated_cycle_is_not_an_error() {
+        // The exact shape that regressed a consumer: a mutual cycle between two
+        // names lives inside a clause that is NOT selected, and both names are
+        // clause-gated. The consumer evaluates clause namespaces to a fixpoint
+        // over the ACTIVE clauses only, so this is not an error and must not be
+        // reported. The definition's unconditional parameters are still ordered.
+        let src = "\
+simulator lang=spectre
+subckt half in out
+  parameters sel=1 nested=1 after=rvalue
+  if (sel==1) {
+    if (nested==1) {
+      parameters branch=2
+    } else {
+      parameters branch=3
+    }
+    parameters rvalue=1k*branch
+  } else if (sel==0) {
+    parameters rvalue=4k
+  } else if (after<0) {
+    // The skipped clause's definitions must stay inactive.
+    parameters bad1=bad2 bad2=bad1 rvalue=missing_from_inactive_clause
+  } else {
+    parameters rvalue=missing_from_else_clause
+  }
+  r1 (in out) resistor r=rvalue
+ends half
+";
+        let nl = parse_netlist(src, "spectre");
+        assert_eq!(nl.subckts.len(), 1, "the deck must parse");
+        assert!(
+            nl.incompletes.is_empty(),
+            "the deck must parse without dropping content"
+        );
+        assert!(
+            nl.errors.is_empty(),
+            "a cycle in a clause-gated namespace must not make the deck unloadable; errors: {}",
+            nl.errors.len()
+        );
+        let sub = &nl.subckts[0];
+        // The unconditional list is still ordered (independent -> source order).
+        assert_eq!(
+            sub.params
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["sel", "nested", "after"]
+        );
+        // The inactive clause body's mutually-cyclic names stay in source order,
+        // untouched by `order_params`.
+        let clauses = &sub.conditionals[0].clauses;
+        assert_eq!(clauses.len(), 4);
+        assert_eq!(clauses[2].condition, "after<0");
+        let inactive = &clauses[2].body;
+        assert_eq!(
+            inactive
+                .params
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["bad1", "bad2", "rvalue"]
+        );
+    }
+
+    #[test]
+    fn spectre_clause_body_sibling_reference_is_not_an_error() {
+        // `x` in the `if` clause references `y`, defined in a sibling `else if`
+        // clause. Each clause is its own gated namespace, so neither the
+        // forward reference nor the split cycle is the parser's error to raise.
+        let src = "\
+simulator lang=spectre
+subckt s a b
+  parameters p=1
+  if (p==1) {
+    parameters x=y*2
+  } else if (p==0) {
+    parameters y=x*2
+  }
+  r1 (a b) resistor r=x
+ends s
+";
+        let nl = parse_netlist(src, "spectre");
+        assert_eq!(nl.subckts.len(), 1, "the deck must parse");
+        assert!(
+            nl.errors.is_empty(),
+            "cross-clause references must not be reported; errors: {}",
+            nl.errors.len()
+        );
+        // Clause bodies are left untouched: source order preserved.
+        let clauses = &nl.subckts[0].conditionals[0].clauses;
+        assert_eq!(clauses[0].body.params[0].name, "x");
+        assert_eq!(clauses[1].body.params[0].name, "y");
+    }
+
+    #[test]
+    fn spice_clause_gated_cycle_is_not_an_error() {
+        // SPICE equivalent: a `.if` clause body holds a mutual `.param` cycle
+        // and a reference to a sibling clause; neither is an error, while the
+        // definition-level `.param`s are still ordered.
+        let src = "* t\n\
+                   .subckt s a b\n\
+                   .param sel=1\n\
+                   .if (sel==1)\n\
+                   .param bad1=bad2\n\
+                   .param bad2=bad1\n\
+                   .param rvalue=bad1\n\
+                   .else\n\
+                   .param other=missing_from_else\n\
+                   .endif\n\
+                   R1 a b rvalue\n\
+                   .ends\n";
+        let nl = parse_netlist(src, "ngspice");
+        assert!(
+            nl.errors.is_empty(),
+            "a SPICE clause-gated cycle must not be reported; errors: {}",
+            nl.errors.len()
+        );
+        let sub = &nl.spice_blocks[0].subckts[0];
+        assert_eq!(
+            sub.params
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["sel"]
+        );
+    }
+
+    // --- Review fixes: numeric literals, ternary `:`, SPICE wrapper + case rule ---
+
+    #[test]
+    fn numeric_scale_suffix_is_not_a_dependency_or_cycle() {
+        // The `k` in `1k` is a numeric scale factor, not a reference to the
+        // parameter `k`: this deck has no cycle and must load.
+        let nl = parse_netlist("simulator lang=spectre\nparameters k=a a=1k\n", "spectre");
+        assert!(
+            nl.errors.is_empty(),
+            "a numeric suffix must not invent a cycle; errors: {}",
+            nl.errors.len()
+        );
+        assert_eq!(
+            nl.params
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "k"]
+        );
+        let a = nl.params.iter().find(|p| p.name == "a").unwrap();
+        assert_eq!(a.value, "1k", "the literal text is untouched");
+    }
+
+    #[test]
+    fn numeric_exponent_is_not_a_dependency_or_cycle() {
+        // The `e` in `1e-3` is the exponent marker, not a reference to `e`.
+        let nl = parse_netlist("simulator lang=spectre\nparameters e=x x=1e-3\n", "spectre");
+        assert!(
+            nl.errors.is_empty(),
+            "a numeric exponent must not invent a cycle; errors: {}",
+            nl.errors.len()
+        );
+        assert_eq!(
+            nl.params
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["x", "e"]
+        );
+        let x = nl.params.iter().find(|p| p.name == "x").unwrap();
+        assert_eq!(x.value, "1e-3", "the literal text is untouched");
+    }
+
+    #[test]
+    fn ternary_colon_is_not_member_qualification_in_rewrite() {
+        // A lone `:` separates the ternary arms; `temp` in an arm is the free
+        // ambient-temperature builtin and must be rewritten.
+        let nl = parse_netlist("simulator lang=spectre\nparameters p=1?temp:0\n", "spectre");
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        assert_eq!(nl.params[0].value, "1?$temp:0");
+    }
+
+    #[test]
+    fn ternary_colon_reference_creates_dependency() {
+        // `y` references `x` inside a ternary arm: the dependency must be seen.
+        let nl = parse_netlist(
+            "simulator lang=spectre\nparameters y=1?x:0 x=2\n",
+            "spectre",
+        );
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        assert_eq!(
+            nl.params
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["x", "y"]
+        );
+    }
+
+    #[test]
+    fn ternary_colon_reference_participates_in_cycle() {
+        // `a` references `b` in a ternary arm and `b` references `a`: a real
+        // cycle the old `:`-as-qualification bug hid entirely.
+        let nl = parse_netlist(
+            "simulator lang=spectre\nparameters a=1?b:0 b=a\n",
+            "spectre",
+        );
+        assert!(
+            !nl.errors.is_empty(),
+            "a ternary-arm cycle must surface through the FFI errors field"
+        );
+        assert_eq!(
+            nl.params
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+    }
+
+    #[test]
+    fn spice_single_quoted_wrapper_is_rewritten() {
+        // A single-quoted token is the dialect's expression wrapper (PRIME),
+        // not a string literal: `temper` inside it is the free builtin.
+        let nl = parse_netlist("* t\n.param p='temper+1'\nR1 a b p\n", "ngspice");
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        let p = nl.spice_blocks[0]
+            .params
+            .iter()
+            .find(|p| p.name == "p")
+            .unwrap();
+        assert_eq!(p.value, "'$temp+1'");
+    }
+
+    #[test]
+    fn spice_single_quoted_wrapper_creates_dependency() {
+        // The wrapper is transparent to dependency extraction. SPICE lists are
+        // not reordered in the projection, so exercise `param_order` directly.
+        let params = vec![
+            super::ffi::Param {
+                name: "b".to_string(),
+                value: "'a*2'".to_string(),
+            },
+            super::ffi::Param {
+                name: "a".to_string(),
+                value: "1".to_string(),
+            },
+        ];
+        assert_eq!(super::param_order(&params, true), Some(vec![1, 0]));
+    }
+
+    #[test]
+    fn spice_dependency_keys_are_case_folded() {
+        // SPICE names are case-insensitive: `A*2` references the parameter `a`.
+        let params = vec![
+            super::ffi::Param {
+                name: "b".to_string(),
+                value: "A*2".to_string(),
+            },
+            super::ffi::Param {
+                name: "a".to_string(),
+                value: "1".to_string(),
+            },
+        ];
+        // Case-folded (SPICE): the edge is seen, so `a` precedes `b`.
+        assert_eq!(super::param_order(&params, true), Some(vec![1, 0]));
+        // Case-sensitive (Spectre): no edge, source order.
+        assert_eq!(super::param_order(&params, false), Some(vec![0, 1]));
+    }
+
+    #[test]
+    fn spice_case_folded_self_reference_and_cycle() {
+        // An uppercase self-reference (`A+1` for parameter `a`) resolves in the
+        // enclosing scope and adds no edge.
+        let selfref = vec![super::ffi::Param {
+            name: "a".to_string(),
+            value: "A+1".to_string(),
+        }];
+        assert!(super::param_order(&selfref, true).is_some());
+        // A mixed-case mutual reference is a real cycle once keys are folded.
+        let cycle = vec![
+            super::ffi::Param {
+                name: "a".to_string(),
+                value: "B".to_string(),
+            },
+            super::ffi::Param {
+                name: "b".to_string(),
+                value: "A".to_string(),
+            },
+        ];
+        assert!(
+            super::param_order(&cycle, true).is_none(),
+            "a case-folded SPICE cycle must be detected"
+        );
+        assert!(
+            super::param_order(&cycle, false).is_some(),
+            "case-sensitive Spectre sees no cycle here"
+        );
+    }
+
+    #[test]
+    fn spice_case_insensitive_cycle_is_reported_without_reordering() {
+        // The same mixed-case cycle through the real entry point: it surfaces
+        // through `errors`, and the list stays in source order.
+        let nl = parse_netlist("* t\n.param a=B\n.param b=A\nR1 x y a\n", "ngspice");
+        assert!(
+            !nl.errors.is_empty(),
+            "a case-folded SPICE cycle must surface through the FFI errors field"
+        );
+        assert_eq!(
+            nl.spice_blocks[0]
+                .params
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+    }
+
+    #[test]
+    fn spice_subckt_header_default_sees_body_param_declaration() {
+        // A body `.param temper=27` shadows the ambient-temperature builtin for
+        // the header default `p=temper`, so `p` keeps the declared binding.
+        let nl = parse_netlist(
+            "* t\n.subckt s a b p=temper\n.param temper=27\nR1 a b p\n.ends\n",
+            "ngspice",
+        );
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        let s = &nl.spice_blocks[0].subckts[0];
+        let p = s.params.iter().find(|p| p.name == "p").unwrap();
+        assert_eq!(
+            p.value, "temper",
+            "a body declaration must shadow the builtin for a header default"
+        );
+    }
+
+    #[test]
+    fn ic_value_is_normalized() {
+        // `ic` values go through the same normalization as every other
+        // projected expression.
+        let nl = parse_netlist("simulator lang=spectre\nic out=temp\n", "spectre");
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        assert_eq!(nl.ics.len(), 1);
+        assert_eq!(nl.ics[0].node, "out");
+        assert_eq!(nl.ics[0].value, "$temp");
     }
 }
