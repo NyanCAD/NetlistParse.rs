@@ -18,9 +18,10 @@
 //!
 //! * the ambient-temperature builtin is canonicalized to the consumer's `$temp`
 //!   (Spectre free `temp` and SPICE free `temper`), and
-//! * each definition's parameter list is emitted in dependency order (an
-//!   expression after the parameters it references), with a true cycle
-//!   reported through the `errors` field.
+//! * each **Spectre** definition's parameter list is emitted in dependency order
+//!   (an expression after the parameters it references), with a true cycle
+//!   reported through the `errors` field. SPICE lists are left in source order
+//!   (a true cycle is still reported); see the crate README for why.
 //!
 //! The FFI struct shapes are unchanged: order inside the existing `Vec`s and
 //! the rewritten text are the only signals.
@@ -316,125 +317,175 @@ fn ident_byte(b: u8) -> bool {
 ///
 /// An identifier is rewritten only when it is genuinely free:
 /// * not immediately a call name (`temp(...)`),
-/// * not qualified with `.` or `::`,
-/// * not inside a quoted string (backslash escapes respected),
+/// * not qualified with `.` or `::` (a single ternary `:` is not qualification),
+/// * not inside a real string literal (double quotes only — a single quote is
+///   the dialects' expression wrapper, `PRIME`, not a string),
 /// * not inside a `v(...)`/`i(...)` argument list (those name nodes/branches),
-/// * not declared as a parameter in `scope` (a declaration shadows the builtin).
+/// * not declared as a parameter in `scope` (a declaration shadows the builtin),
+/// * not part of a numeric literal (`1k`, `1e-3`).
 ///
 /// Spectre matches `temp` case-sensitively (its identifiers are case-sensitive);
 /// SPICE matches `temper` case-insensitively (its identifiers are case-folded,
 /// mirroring the consumer's `spiceExpr`).
 fn rewrite_temp(text: &str, spice: bool, scope: &HashSet<String>) -> String {
     let needle = if spice { "temper" } else { "temp" };
+    let occs = scan_expr_identifiers(text);
+    if occs.is_empty() {
+        return text.to_string();
+    }
     let bytes = text.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(text.len() + 8);
-    let mut access_frames: Vec<bool> = Vec::new();
-    let mut access_depth = 0usize;
-    let mut quote: Option<u8> = None;
-    let mut i = 0usize;
-    while i < bytes.len() {
-        let c = bytes[i];
-        if let Some(q) = quote {
-            out.push(c);
-            if c == b'\\' && i + 1 < bytes.len() {
-                out.push(bytes[i + 1]);
-                i += 2;
-                continue;
-            }
-            if c == q {
-                quote = None;
-            }
-            i += 1;
-            continue;
+    let mut cursor = 0usize;
+    for o in &occs {
+        out.extend_from_slice(&bytes[cursor..o.start]);
+        let hit = if spice {
+            o.text.eq_ignore_ascii_case(needle)
+        } else {
+            o.text == needle
+        };
+        let declared = if spice {
+            scope.contains(&o.text.to_ascii_lowercase())
+        } else {
+            scope.contains(&o.text)
+        };
+        if o.free && hit && !declared {
+            out.extend_from_slice(b"$temp");
+        } else {
+            out.extend_from_slice(&bytes[o.start..o.end]);
         }
-        if c == b'"' || c == b'\'' {
-            quote = Some(c);
-            out.push(c);
-            i += 1;
-            continue;
-        }
-        if c.is_ascii_alphabetic() || c == b'_' || c == b'$' {
-            let start = i;
-            let mut j = i;
-            while j < bytes.len() && ident_byte(bytes[j]) {
-                j += 1;
-            }
-            let ident = &text[start..j];
-            let mut k = j;
-            while k < bytes.len() && bytes[k].is_ascii_whitespace() {
-                k += 1;
-            }
-            let is_call = k < bytes.len() && bytes[k] == b'(';
-            let prev = if start > 0 { bytes[start - 1] } else { 0 };
-            let next = if j < bytes.len() { bytes[j] } else { 0 };
-            let qualified = matches!(prev, b'.' | b':') || matches!(next, b'.' | b':');
-            let hit = if spice {
-                ident.eq_ignore_ascii_case(needle)
-            } else {
-                ident == needle
-            };
-            let declared = if spice {
-                scope.contains(&ident.to_ascii_lowercase())
-            } else {
-                scope.contains(ident)
-            };
-            if hit && !is_call && !qualified && access_depth == 0 && !declared {
-                out.extend_from_slice(b"$temp");
-            } else {
-                out.extend_from_slice(ident.as_bytes());
-            }
-            if is_call {
-                let is_access = ident.eq_ignore_ascii_case("v") || ident.eq_ignore_ascii_case("i");
-                out.extend_from_slice(&bytes[j..k]);
-                out.push(b'(');
-                access_frames.push(is_access);
-                if is_access {
-                    access_depth += 1;
-                }
-                i = k + 1;
-            } else {
-                i = j;
-            }
-            continue;
-        }
-        if c == b'(' {
-            access_frames.push(false);
-        } else if c == b')' && access_frames.pop() == Some(true) {
-            access_depth = access_depth.saturating_sub(1);
-        }
-        out.push(c);
-        i += 1;
+        cursor = o.end;
     }
+    out.extend_from_slice(&bytes[cursor..]);
     // Only ASCII was inserted; the input was valid UTF-8, so this cannot fail.
     String::from_utf8(out).expect("temperature rewrite preserves UTF-8")
 }
 
-/// Free identifiers referenced by an expression: those that are not call names
-/// (`f(`), not qualified (`.x`/`::x`) and not inside a `v(...)`/`i(...)`
-/// argument list. Used to build parameter dependency edges.
-fn expr_identifiers(text: &str) -> Vec<String> {
+/// One identifier occurrence in verbatim expression text.
+struct ExprIdent {
+    start: usize,
+    end: usize,
+    text: String,
+    /// Not a call name, not `.`/`::`-qualified, and not inside a `v(...)`/`i(...)`
+    /// argument list — i.e. a genuinely free name.
+    free: bool,
+}
+
+/// True when a numeric literal starts at byte `i`: a digit, or a `.` directly
+/// followed by a digit (the lexers' `.5` form).
+fn number_starts_at(bytes: &[u8], i: usize) -> bool {
+    match bytes.get(i).copied() {
+        Some(b'0'..=b'9') => true,
+        Some(b'.') => matches!(bytes.get(i + 1).copied(), Some(b'0'..=b'9')),
+        _ => false,
+    }
+}
+
+/// Bytes that continue a numeric literal past its digits: the scale-factor /
+/// unit / identifier suffix run the lexers accept (`1k`, `1meg`, `2n`, `1N3064`).
+fn number_suffix_byte(b: u8) -> bool {
+    ident_byte(b) || b == b'!'
+}
+
+/// Consume a complete dialect numeric literal starting at `i`, returning its end
+/// byte index. Mirrors `lex_number`: digits, an optional fraction, an optional
+/// base specifier (`12'hAB`) or exponent (`1e-3`), then the scale-factor suffix
+/// run. Consuming the whole literal is what stops a suffix letter from being
+/// read as a free identifier (`a=1k` must not depend on `k`; `x=1e-3` must not
+/// depend on `e`).
+fn number_end(bytes: &[u8], i: usize) -> usize {
+    let mut j = i;
+    while matches!(bytes.get(j).copied(), Some(b'0'..=b'9')) {
+        j += 1;
+    }
+    if bytes.get(j) == Some(&b'.') {
+        j += 1;
+        while matches!(bytes.get(j).copied(), Some(b'0'..=b'9')) {
+            j += 1;
+        }
+    }
+    match bytes.get(j).copied() {
+        // Base specifier: `'` + base char + hex digits (e.g. `12'hAB`).
+        Some(b'\'')
+            if matches!(
+                bytes.get(j + 1).copied(),
+                Some(b'd' | b'D' | b'h' | b'H' | b'o' | b'O' | b'b' | b'B')
+            ) =>
+        {
+            j += 2;
+            while matches!(bytes.get(j).copied(), Some(c) if c.is_ascii_hexdigit()) {
+                j += 1;
+            }
+        }
+        Some(b'e') | Some(b'E') => {
+            j += 1;
+            if matches!(bytes.get(j).copied(), Some(b'+') | Some(b'-')) {
+                j += 1;
+            }
+            while matches!(bytes.get(j).copied(), Some(b'0'..=b'9')) {
+                j += 1;
+            }
+        }
+        _ => {}
+    }
+    while matches!(bytes.get(j).copied(), Some(c) if number_suffix_byte(c)) {
+        j += 1;
+    }
+    j
+}
+
+/// A name preceded or followed by `.`, or surrounded by `::`, is a member
+/// access, not a free name. A single ternary `:` is NOT qualification, so
+/// `a ? b : c` references the free names `b` and `c`.
+fn is_qualified(bytes: &[u8], start: usize, end: usize) -> bool {
+    let prev_dot = start > 0 && bytes[start - 1] == b'.';
+    let next_dot = bytes.get(end) == Some(&b'.');
+    let prev_colon2 = start >= 2 && bytes[start - 1] == b':' && bytes[start - 2] == b':';
+    let next_colon2 = bytes.get(end) == Some(&b':') && bytes.get(end + 1) == Some(&b':');
+    prev_dot || next_dot || prev_colon2 || next_colon2
+}
+
+/// Scan verbatim expression text for identifier occurrences.
+///
+/// Three details keep the scan faithful to the dialect lexers:
+/// * a complete numeric literal is consumed whole (see `number_end`), so its
+///   letters never masquerade as identifiers;
+/// * a single quote wraps an expression (`PRIME` in both lexers) and is skipped
+///   rather than opening a string, so `'temper+1'` is scanned; only a double
+///   quote opens a real string literal;
+/// * a call name (`f(`), a `v(...)`/`i(...)` argument, and a `.`/`::`-qualified
+///   name are all marked non-free.
+fn scan_expr_identifiers(text: &str) -> Vec<ExprIdent> {
     let bytes = text.as_bytes();
     let mut out = Vec::new();
     let mut access_frames: Vec<bool> = Vec::new();
     let mut access_depth = 0usize;
-    let mut quote: Option<u8> = None;
+    let mut in_string = false;
     let mut i = 0usize;
     while i < bytes.len() {
         let c = bytes[i];
-        if let Some(q) = quote {
+        if in_string {
             if c == b'\\' && i + 1 < bytes.len() {
                 i += 2;
                 continue;
             }
-            if c == q {
-                quote = None;
+            if c == b'"' {
+                in_string = false;
             }
             i += 1;
             continue;
         }
-        if c == b'"' || c == b'\'' {
-            quote = Some(c);
+        if c == b'"' {
+            in_string = true;
             i += 1;
+            continue;
+        }
+        if c == b'\'' {
+            // Expression wrapper (`PRIME`), not a string literal.
+            i += 1;
+            continue;
+        }
+        if number_starts_at(bytes, i) {
+            i = number_end(bytes, i);
             continue;
         }
         if c.is_ascii_alphabetic() || c == b'_' || c == b'$' {
@@ -449,12 +500,13 @@ fn expr_identifiers(text: &str) -> Vec<String> {
                 k += 1;
             }
             let is_call = k < bytes.len() && bytes[k] == b'(';
-            let prev = if start > 0 { bytes[start - 1] } else { 0 };
-            let next = if j < bytes.len() { bytes[j] } else { 0 };
-            let qualified = matches!(prev, b'.' | b':') || matches!(next, b'.' | b':');
-            if !is_call && !qualified && access_depth == 0 {
-                out.push(ident.to_string());
-            }
+            let qualified = is_qualified(bytes, start, j);
+            out.push(ExprIdent {
+                start,
+                end: j,
+                text: ident.to_string(),
+                free: !is_call && !qualified && access_depth == 0,
+            });
             if is_call {
                 let is_access = ident.eq_ignore_ascii_case("v") || ident.eq_ignore_ascii_case("i");
                 access_frames.push(is_access);
@@ -477,40 +529,58 @@ fn expr_identifiers(text: &str) -> Vec<String> {
     out
 }
 
-/// Reorder a definition's parameter list so each expression follows the
-/// parameters it references.
+/// Free identifiers referenced by an expression: those that are not call names
+/// (`f(`), not qualified (`.x`/`::x`) and not inside a `v(...)`/`i(...)`
+/// argument list. Used to build parameter dependency edges.
+fn expr_identifiers(text: &str) -> Vec<String> {
+    scan_expr_identifiers(text)
+        .into_iter()
+        .filter(|o| o.free)
+        .map(|o| o.text)
+        .collect()
+}
+/// Compute a dependency order for a parameter list: each parameter's index is
+/// placed after the indices of the parameters its value references.
 ///
-/// A self-reference (a reference to one's own name) denotes the enclosing scope
-/// and adds no edge — the same rule VACASK applies in
+/// `spice` selects the dialect's case rule for the dependency keys — SPICE
+/// identifiers are case-folded (its names are case-insensitive), Spectre's are
+/// kept verbatim — matching how `rewrite_temp` looks names up. Only the
+/// comparison keys are normalized; the emitted spelling is never touched.
+///
+/// A self-reference (a value naming its own parameter) denotes the enclosing
+/// scope and adds no edge — the same rule VACASK applies in
 /// `parameterExpressionOrder`. Independent parameters keep their source order
 /// (stable: a min-heap on the source index breaks ties), and a reference to a
-/// later parameter is an edge, so forward references are resolved.
-///
-/// Returns `Err(the input)` on a true cycle so the caller can surface it through
-/// the FFI `errors` field rather than dropping or silently reordering it.
-///
-/// Only *definition-level* (unconditional) lists are passed here. A conditional
-/// clause body's parameters are clause-gated and are deliberately never ordered
-/// — see `collect_scope` — so a cycle among them can never reach this function.
-fn order_params(params: Vec<ffi::Param>) -> Result<Vec<ffi::Param>, Vec<ffi::Param>> {
+/// later parameter is an edge, so forward references are resolved. Returns
+/// `None` on a true cycle.
+fn param_order(params: &[ffi::Param], spice: bool) -> Option<Vec<usize>> {
     let n = params.len();
     if n <= 1 {
-        return Ok(params);
+        return Some((0..n).collect());
     }
+    let key = |s: &str| -> String {
+        if spice {
+            s.to_ascii_lowercase()
+        } else {
+            s.to_string()
+        }
+    };
     // A reference resolves to the parameter's last definition (later wins).
-    let mut index: HashMap<&str, usize> = HashMap::with_capacity(n);
+    let mut index: HashMap<String, usize> = HashMap::with_capacity(n);
     for (i, p) in params.iter().enumerate() {
-        index.insert(p.name.as_str(), i);
+        index.insert(key(&p.name), i);
     }
     let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
     let mut indeg = vec![0usize; n];
     for (i, p) in params.iter().enumerate() {
+        let own = key(&p.name);
         for r in expr_identifiers(&p.value) {
-            if r == p.name {
+            let rk = key(&r);
+            if rk == own {
                 // Self-reference: resolves in the enclosing scope, no edge.
                 continue;
             }
-            if let Some(&j) = index.get(r.as_str()) {
+            if let Some(&j) = index.get(&rk) {
                 if j != i {
                     succ[j].push(i);
                     indeg[i] += 1;
@@ -536,27 +606,57 @@ fn order_params(params: Vec<ffi::Param>) -> Result<Vec<ffi::Param>, Vec<ffi::Par
         }
     }
     if order.len() != n {
-        return Err(params);
+        return None;
     }
-    let mut slots: Vec<Option<ffi::Param>> = params.into_iter().map(Some).collect();
-    let mut out = Vec::with_capacity(n);
-    for i in order {
-        out.push(slots[i].take().expect("each source index appears once"));
-    }
-    Ok(out)
+    Some(order)
 }
 
-/// Order a parameter list, surfacing a cycle through `errors` (a synthetic,
-/// zero-width `ParseError` — the FFI carries no message channel) while keeping
-/// the parameters in source order rather than dropping them.
+/// Reorder a definition's parameter list into dependency order, surfacing a
+/// true cycle through `errors` (a synthetic, zero-width `ParseError` — the FFI
+/// carries no message channel) while keeping the parameters in source order
+/// rather than dropping or silently reordering them.
+///
+/// This is the **Spectre-only** ordering pass. The consumer's former sorter
+/// ordered Spectre definitions alone, and reordering a SPICE list changes name
+/// resolution (a SPICE subckt `a=b` used to read the enclosing `b`; a moved
+/// local definition would win instead). SPICE lists pass through
+/// `checked_source_order` instead.
+///
+/// Only *definition-level* (unconditional) lists are passed here. A conditional
+/// clause body's parameters are clause-gated and are deliberately never ordered
+/// — see `collect_scope` — so a cycle among them can never reach this function.
 fn ordered(params: Vec<ffi::Param>, errors: &mut Vec<ffi::ParseError>) -> Vec<ffi::Param> {
-    match order_params(params) {
-        Ok(p) => p,
-        Err(orig) => {
+    match param_order(&params, false) {
+        Some(order) => {
+            let mut slots: Vec<Option<ffi::Param>> = params.into_iter().map(Some).collect();
+            order
+                .into_iter()
+                .map(|i| slots[i].take().expect("each source index appears once"))
+                .collect()
+        }
+        None => {
             errors.push(ffi::ParseError { start: 0, end: 0 });
-            orig
+            params
         }
     }
+}
+
+/// Analyse a definition-level SPICE parameter list for a genuine cycle but leave
+/// its emitted order untouched.
+///
+/// SPICE lists are not dependency sorted (only Spectre definitions are — see
+/// `ordered`), yet a true unconditional cycle is still surfaced through `errors`
+/// as before. The dependency keys are case-folded, because SPICE identifiers are
+/// case-insensitive. Clause-gated lists never reach here (see
+/// `project_spice_block_children`).
+fn checked_source_order(
+    params: Vec<ffi::Param>,
+    errors: &mut Vec<ffi::ParseError>,
+) -> Vec<ffi::Param> {
+    if param_order(&params, true).is_none() {
+        errors.push(ffi::ParseError { start: 0, end: 0 });
+    }
+    params
 }
 
 // --- element projections ---
@@ -1145,21 +1245,29 @@ fn project_spice_subckt(
     errors: &mut Vec<ffi::ParseError>,
 ) -> ffi::SpiceSubckt {
     // Formal header params (`.subckt … w=1 l=1`) are visible to the body, so
-    // seed the body scope with them.
+    // seed the body scope with them. The whole definition namespace is visible
+    // to the header defaults too: a body `.param` (even one inside `.if`) that
+    // declares `temper` shadows the ambient-temperature builtin for a header
+    // default such as `.subckt s a b p=temper`, so collect body declarations
+    // before projecting the header.
     let header: Vec<ast::Parameter> = s.params().collect();
     let mut scope = inherited.clone();
     for p in &header {
         scope.insert(tok_text(p.name()).to_ascii_lowercase());
     }
-    let body = project_spice_block_children(s.body(), &scope, errors, true);
-    // Formal params first, then body `.param` statements, then ordered so each
-    // expression follows the parameters it references.
+    let body_children: Vec<SyntaxNode> = s.body().collect();
+    collect_spice_param_names(&body_children, &mut scope);
+
+    let body = project_spice_block_children(body_children.into_iter(), &scope, errors, true);
+    // Formal params first, then body `.param` statements. SPICE lists are not
+    // reordered (only Spectre definitions are — see `ordered`); a genuine
+    // definition-level cycle is still reported.
     let mut params: Vec<ffi::Param> = header
         .iter()
         .map(|p| project_spice_param(p, &scope))
         .collect();
     params.extend(body.params);
-    let params = ordered(params, errors);
+    let params = checked_source_order(params, errors);
     ffi::SpiceSubckt {
         name: tok_text(s.name()),
         ports: s.ports().map(|p| p.text()).collect(),
@@ -1200,18 +1308,18 @@ fn collect_spice_param_names(children: &[SyntaxNode], out: &mut HashSet<String>)
 /// Project an iterator of SPICE children (params, models, subckts, devices,
 /// includes, conditionals) into a `SpiceBlock`.
 ///
-/// `order` mirrors `collect_scope`: `true` at a definition level, where the
-/// unconditional `.param` list is dependency sorted and a true cycle is a real
-/// error; `false` inside a conditional clause body, whose `.param` names are
-/// clause-gated and resolved by the consumer (only the active clauses run), so
-/// they are left in source order and never report a cycle — the FFI `errors`
-/// channel is a bare span and cannot distinguish "harmless cycle in an
-/// unselected clause" from a genuine error.
+/// `definition_level` mirrors `collect_scope`: `true` at a definition level,
+/// where the unconditional `.param` list is analysed for a genuine cycle (but
+/// never reordered — see `checked_source_order`); `false` inside a conditional
+/// clause body, whose `.param` names are clause-gated and resolved by the
+/// consumer (only the active clauses run), so they are left in source order and
+/// never report a cycle — the FFI `errors` channel is a bare span and cannot
+/// distinguish "harmless cycle in an unselected clause" from a genuine error.
 fn project_spice_block_children(
     children: impl Iterator<Item = SyntaxNode>,
     inherited: &HashSet<String>,
     errors: &mut Vec<ffi::ParseError>,
-    order: bool,
+    definition_level: bool,
 ) -> ffi::SpiceBlock {
     let children: Vec<SyntaxNode> = children.collect();
     // `.param` declarations (including those inside `.if` clause bodies) are
@@ -1278,8 +1386,8 @@ fn project_spice_block_children(
             }
         }
     }
-    if order {
-        block.params = ordered(block.params, errors);
+    if definition_level {
+        block.params = checked_source_order(block.params, errors);
     }
     block
 }
@@ -1446,7 +1554,9 @@ fn collect_scope(
                 if let Some(ic) = sast::Ic::cast(stmt) {
                     collected.ics.extend(ic.params().map(|p| ffi::IcItem {
                         node: p.node().map(|n| n.path()).unwrap_or_default(),
-                        value: p.value_text().unwrap_or_default(),
+                        // Every projected expression is normalized, IC values
+                        // included.
+                        value: rewrite_temp(&p.value_text().unwrap_or_default(), false, scope),
                     }));
                 }
             }
@@ -1708,8 +1818,8 @@ fn parse_spice_lib(
             }
         }
     }
-    block.params = ordered(block.params, &mut errors);
-
+    // The selected section's `.param`s were already analysed at definition
+    // level inside `project_spice_block_children`; they are never reordered.
     let mut nl = empty_netlist();
     nl.spice_blocks.push(block);
     nl.errors = errors;
@@ -2686,24 +2796,26 @@ ends adnfet\n";
     }
 
     #[test]
-    fn spice_parameters_are_dependency_ordered() {
+    fn spice_forward_reference_list_stays_in_source_order() {
+        // Dependency ordering is Spectre-only: a SPICE forward reference is
+        // left exactly where it was written, and is not an error.
         let nl = parse_netlist("* t\n.param b=a*2\n.param a=1\nR1 x y b\n", "ngspice");
         assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
         let b = &nl.spice_blocks[0];
         assert_eq!(
             b.params.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
-            ["a", "b"]
+            ["b", "a"]
         );
     }
 
     #[test]
-    fn spice_subckt_parameters_are_dependency_ordered() {
+    fn spice_subckt_parameters_keep_source_order() {
         let nl = parse_netlist(
             "* t\n.subckt rcblock a b w=1u l=2u\n.param rint=3k\n.param cint=1p\nR1 a b rint\n.ends\n",
             "ngspice",
         );
         let s = &nl.spice_blocks[0].subckts[0];
-        // Independent parameters keep source order (header first, then body).
+        // Source order (header first, then body): SPICE lists are not sorted.
         assert_eq!(
             s.params.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
             ["w", "l", "rint", "cint"]
@@ -3006,5 +3118,222 @@ ends s
                 .collect::<Vec<_>>(),
             ["sel"]
         );
+    }
+
+    // --- Review fixes: numeric literals, ternary `:`, SPICE wrapper + case rule ---
+
+    #[test]
+    fn numeric_scale_suffix_is_not_a_dependency_or_cycle() {
+        // The `k` in `1k` is a numeric scale factor, not a reference to the
+        // parameter `k`: this deck has no cycle and must load.
+        let nl = parse_netlist("simulator lang=spectre\nparameters k=a a=1k\n", "spectre");
+        assert!(
+            nl.errors.is_empty(),
+            "a numeric suffix must not invent a cycle; errors: {}",
+            nl.errors.len()
+        );
+        assert_eq!(
+            nl.params
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "k"]
+        );
+        let a = nl.params.iter().find(|p| p.name == "a").unwrap();
+        assert_eq!(a.value, "1k", "the literal text is untouched");
+    }
+
+    #[test]
+    fn numeric_exponent_is_not_a_dependency_or_cycle() {
+        // The `e` in `1e-3` is the exponent marker, not a reference to `e`.
+        let nl = parse_netlist("simulator lang=spectre\nparameters e=x x=1e-3\n", "spectre");
+        assert!(
+            nl.errors.is_empty(),
+            "a numeric exponent must not invent a cycle; errors: {}",
+            nl.errors.len()
+        );
+        assert_eq!(
+            nl.params
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["x", "e"]
+        );
+        let x = nl.params.iter().find(|p| p.name == "x").unwrap();
+        assert_eq!(x.value, "1e-3", "the literal text is untouched");
+    }
+
+    #[test]
+    fn ternary_colon_is_not_member_qualification_in_rewrite() {
+        // A lone `:` separates the ternary arms; `temp` in an arm is the free
+        // ambient-temperature builtin and must be rewritten.
+        let nl = parse_netlist("simulator lang=spectre\nparameters p=1?temp:0\n", "spectre");
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        assert_eq!(nl.params[0].value, "1?$temp:0");
+    }
+
+    #[test]
+    fn ternary_colon_reference_creates_dependency() {
+        // `y` references `x` inside a ternary arm: the dependency must be seen.
+        let nl = parse_netlist(
+            "simulator lang=spectre\nparameters y=1?x:0 x=2\n",
+            "spectre",
+        );
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        assert_eq!(
+            nl.params
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["x", "y"]
+        );
+    }
+
+    #[test]
+    fn ternary_colon_reference_participates_in_cycle() {
+        // `a` references `b` in a ternary arm and `b` references `a`: a real
+        // cycle the old `:`-as-qualification bug hid entirely.
+        let nl = parse_netlist(
+            "simulator lang=spectre\nparameters a=1?b:0 b=a\n",
+            "spectre",
+        );
+        assert!(
+            !nl.errors.is_empty(),
+            "a ternary-arm cycle must surface through the FFI errors field"
+        );
+        assert_eq!(
+            nl.params
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+    }
+
+    #[test]
+    fn spice_single_quoted_wrapper_is_rewritten() {
+        // A single-quoted token is the dialect's expression wrapper (PRIME),
+        // not a string literal: `temper` inside it is the free builtin.
+        let nl = parse_netlist("* t\n.param p='temper+1'\nR1 a b p\n", "ngspice");
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        let p = nl.spice_blocks[0]
+            .params
+            .iter()
+            .find(|p| p.name == "p")
+            .unwrap();
+        assert_eq!(p.value, "'$temp+1'");
+    }
+
+    #[test]
+    fn spice_single_quoted_wrapper_creates_dependency() {
+        // The wrapper is transparent to dependency extraction. SPICE lists are
+        // not reordered in the projection, so exercise `param_order` directly.
+        let params = vec![
+            super::ffi::Param {
+                name: "b".to_string(),
+                value: "'a*2'".to_string(),
+            },
+            super::ffi::Param {
+                name: "a".to_string(),
+                value: "1".to_string(),
+            },
+        ];
+        assert_eq!(super::param_order(&params, true), Some(vec![1, 0]));
+    }
+
+    #[test]
+    fn spice_dependency_keys_are_case_folded() {
+        // SPICE names are case-insensitive: `A*2` references the parameter `a`.
+        let params = vec![
+            super::ffi::Param {
+                name: "b".to_string(),
+                value: "A*2".to_string(),
+            },
+            super::ffi::Param {
+                name: "a".to_string(),
+                value: "1".to_string(),
+            },
+        ];
+        // Case-folded (SPICE): the edge is seen, so `a` precedes `b`.
+        assert_eq!(super::param_order(&params, true), Some(vec![1, 0]));
+        // Case-sensitive (Spectre): no edge, source order.
+        assert_eq!(super::param_order(&params, false), Some(vec![0, 1]));
+    }
+
+    #[test]
+    fn spice_case_folded_self_reference_and_cycle() {
+        // An uppercase self-reference (`A+1` for parameter `a`) resolves in the
+        // enclosing scope and adds no edge.
+        let selfref = vec![super::ffi::Param {
+            name: "a".to_string(),
+            value: "A+1".to_string(),
+        }];
+        assert!(super::param_order(&selfref, true).is_some());
+        // A mixed-case mutual reference is a real cycle once keys are folded.
+        let cycle = vec![
+            super::ffi::Param {
+                name: "a".to_string(),
+                value: "B".to_string(),
+            },
+            super::ffi::Param {
+                name: "b".to_string(),
+                value: "A".to_string(),
+            },
+        ];
+        assert!(
+            super::param_order(&cycle, true).is_none(),
+            "a case-folded SPICE cycle must be detected"
+        );
+        assert!(
+            super::param_order(&cycle, false).is_some(),
+            "case-sensitive Spectre sees no cycle here"
+        );
+    }
+
+    #[test]
+    fn spice_case_insensitive_cycle_is_reported_without_reordering() {
+        // The same mixed-case cycle through the real entry point: it surfaces
+        // through `errors`, and the list stays in source order.
+        let nl = parse_netlist("* t\n.param a=B\n.param b=A\nR1 x y a\n", "ngspice");
+        assert!(
+            !nl.errors.is_empty(),
+            "a case-folded SPICE cycle must surface through the FFI errors field"
+        );
+        assert_eq!(
+            nl.spice_blocks[0]
+                .params
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+    }
+
+    #[test]
+    fn spice_subckt_header_default_sees_body_param_declaration() {
+        // A body `.param temper=27` shadows the ambient-temperature builtin for
+        // the header default `p=temper`, so `p` keeps the declared binding.
+        let nl = parse_netlist(
+            "* t\n.subckt s a b p=temper\n.param temper=27\nR1 a b p\n.ends\n",
+            "ngspice",
+        );
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        let s = &nl.spice_blocks[0].subckts[0];
+        let p = s.params.iter().find(|p| p.name == "p").unwrap();
+        assert_eq!(
+            p.value, "temper",
+            "a body declaration must shadow the builtin for a header default"
+        );
+    }
+
+    #[test]
+    fn ic_value_is_normalized() {
+        // `ic` values go through the same normalization as every other
+        // projected expression.
+        let nl = parse_netlist("simulator lang=spectre\nic out=temp\n", "spectre");
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        assert_eq!(nl.ics.len(), 1);
+        assert_eq!(nl.ics[0].node, "out");
+        assert_eq!(nl.ics[0].value, "$temp");
     }
 }
