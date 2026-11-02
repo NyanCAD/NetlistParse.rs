@@ -12,7 +12,18 @@
 //! Parameter/expression values are carried as **verbatim source text**: the
 //! consumer re-parses them with its own expression engine (this mirrors how
 //! VACASK round-trips expressions through `parseExpression`, and keeps this
-//! layer free of a bespoke Spectre expression evaluator).
+//! layer free of a bespoke Spectre expression evaluator). Two dialect
+//! normalizations are applied to that text before it crosses the FFI, both
+//! using the parser's own scope knowledge so the consumer needs neither:
+//!
+//! * the ambient-temperature builtin is canonicalized to the consumer's `$temp`
+//!   (Spectre free `temp` and SPICE free `temper`), and
+//! * each definition's parameter list is emitted in dependency order (an
+//!   expression after the parameters it references), with a true cycle
+//!   reported through the `errors` field.
+//!
+//! The FFI struct shapes are unchanged: order inside the existing `Vec`s and
+//! the rewritten text are the only signals.
 
 use netlist_syntax::ast::{self, AstNode};
 use netlist_syntax::spectre_ast as sast;
@@ -20,6 +31,8 @@ use netlist_syntax::{
     parse_spectre_with, parse_spice_dialect, Dialect, StartLang, SyntaxKind, SyntaxNode,
     SyntaxToken,
 };
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 #[cxx::bridge(namespace = "netlist")]
 mod ffi {
@@ -265,52 +278,319 @@ fn unquote(s: &str) -> String {
     }
 }
 
-// --- element projections ---
+// --- dialect temperature builtins and parameter ordering ---
 
-fn project_param(p: &sast::Parameter) -> ffi::Param {
-    ffi::Param {
-        name: tok_text(p.name()),
-        value: p.value_text().unwrap_or_default(),
+/// Bytes that may appear inside a dialect identifier (alnum, `_`, `$`).
+fn ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+}
+
+/// Rewrite free dialect temperature builtins to `$temp` in verbatim expression
+/// source text.
+///
+/// Spectre's `temp` and SPICE's `temper` both name the ambient simulation
+/// temperature; the consumer (VACASK) spells that builtin `$temp`. Doing the
+/// rewrite here — next to the parser's own scope knowledge — lets the consumer
+/// drop its post-parse scope re-derivation entirely.
+///
+/// An identifier is rewritten only when it is genuinely free:
+/// * not immediately a call name (`temp(...)`),
+/// * not qualified with `.` or `::`,
+/// * not inside a quoted string (backslash escapes respected),
+/// * not inside a `v(...)`/`i(...)` argument list (those name nodes/branches),
+/// * not declared as a parameter in `scope` (a declaration shadows the builtin).
+///
+/// Spectre matches `temp` case-sensitively (its identifiers are case-sensitive);
+/// SPICE matches `temper` case-insensitively (its identifiers are case-folded,
+/// mirroring the consumer's `spiceExpr`).
+fn rewrite_temp(text: &str, spice: bool, scope: &HashSet<String>) -> String {
+    let needle = if spice { "temper" } else { "temp" };
+    let bytes = text.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(text.len() + 8);
+    let mut access_frames: Vec<bool> = Vec::new();
+    let mut access_depth = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(q) = quote {
+            out.push(c);
+            if c == b'\\' && i + 1 < bytes.len() {
+                out.push(bytes[i + 1]);
+                i += 2;
+                continue;
+            }
+            if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'"' || c == b'\'' {
+            quote = Some(c);
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c.is_ascii_alphabetic() || c == b'_' || c == b'$' {
+            let start = i;
+            let mut j = i;
+            while j < bytes.len() && ident_byte(bytes[j]) {
+                j += 1;
+            }
+            let ident = &text[start..j];
+            let mut k = j;
+            while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            let is_call = k < bytes.len() && bytes[k] == b'(';
+            let prev = if start > 0 { bytes[start - 1] } else { 0 };
+            let next = if j < bytes.len() { bytes[j] } else { 0 };
+            let qualified = matches!(prev, b'.' | b':') || matches!(next, b'.' | b':');
+            let hit = if spice {
+                ident.eq_ignore_ascii_case(needle)
+            } else {
+                ident == needle
+            };
+            let declared = if spice {
+                scope.contains(&ident.to_ascii_lowercase())
+            } else {
+                scope.contains(ident)
+            };
+            if hit && !is_call && !qualified && access_depth == 0 && !declared {
+                out.extend_from_slice(b"$temp");
+            } else {
+                out.extend_from_slice(ident.as_bytes());
+            }
+            if is_call {
+                let is_access = ident.eq_ignore_ascii_case("v") || ident.eq_ignore_ascii_case("i");
+                out.extend_from_slice(&bytes[j..k]);
+                out.push(b'(');
+                access_frames.push(is_access);
+                if is_access {
+                    access_depth += 1;
+                }
+                i = k + 1;
+            } else {
+                i = j;
+            }
+            continue;
+        }
+        if c == b'(' {
+            access_frames.push(false);
+        } else if c == b')' && access_frames.pop() == Some(true) {
+            access_depth = access_depth.saturating_sub(1);
+        }
+        out.push(c);
+        i += 1;
+    }
+    // Only ASCII was inserted; the input was valid UTF-8, so this cannot fail.
+    String::from_utf8(out).expect("temperature rewrite preserves UTF-8")
+}
+
+/// Free identifiers referenced by an expression: those that are not call names
+/// (`f(`), not qualified (`.x`/`::x`) and not inside a `v(...)`/`i(...)`
+/// argument list. Used to build parameter dependency edges.
+fn expr_identifiers(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut access_frames: Vec<bool> = Vec::new();
+    let mut access_depth = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(q) = quote {
+            if c == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'"' || c == b'\'' {
+            quote = Some(c);
+            i += 1;
+            continue;
+        }
+        if c.is_ascii_alphabetic() || c == b'_' || c == b'$' {
+            let start = i;
+            let mut j = i;
+            while j < bytes.len() && ident_byte(bytes[j]) {
+                j += 1;
+            }
+            let ident = &text[start..j];
+            let mut k = j;
+            while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            let is_call = k < bytes.len() && bytes[k] == b'(';
+            let prev = if start > 0 { bytes[start - 1] } else { 0 };
+            let next = if j < bytes.len() { bytes[j] } else { 0 };
+            let qualified = matches!(prev, b'.' | b':') || matches!(next, b'.' | b':');
+            if !is_call && !qualified && access_depth == 0 {
+                out.push(ident.to_string());
+            }
+            if is_call {
+                let is_access = ident.eq_ignore_ascii_case("v") || ident.eq_ignore_ascii_case("i");
+                access_frames.push(is_access);
+                if is_access {
+                    access_depth += 1;
+                }
+                i = k + 1;
+            } else {
+                i = j;
+            }
+            continue;
+        }
+        if c == b'(' {
+            access_frames.push(false);
+        } else if c == b')' && access_frames.pop() == Some(true) {
+            access_depth = access_depth.saturating_sub(1);
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Reorder a definition's parameter list so each expression follows the
+/// parameters it references.
+///
+/// A self-reference (a reference to one's own name) denotes the enclosing scope
+/// and adds no edge — the same rule VACASK applies in
+/// `parameterExpressionOrder`. Independent parameters keep their source order
+/// (stable: a min-heap on the source index breaks ties), and a reference to a
+/// later parameter is an edge, so forward references are resolved.
+///
+/// Returns `Err(the input)` on a true cycle so the caller can surface it through
+/// the FFI `errors` field rather than dropping or silently reordering it.
+fn order_params(params: Vec<ffi::Param>) -> Result<Vec<ffi::Param>, Vec<ffi::Param>> {
+    let n = params.len();
+    if n <= 1 {
+        return Ok(params);
+    }
+    // A reference resolves to the parameter's last definition (later wins).
+    let mut index: HashMap<&str, usize> = HashMap::with_capacity(n);
+    for (i, p) in params.iter().enumerate() {
+        index.insert(p.name.as_str(), i);
+    }
+    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut indeg = vec![0usize; n];
+    for (i, p) in params.iter().enumerate() {
+        for r in expr_identifiers(&p.value) {
+            if r == p.name {
+                // Self-reference: resolves in the enclosing scope, no edge.
+                continue;
+            }
+            if let Some(&j) = index.get(r.as_str()) {
+                if j != i {
+                    succ[j].push(i);
+                    indeg[i] += 1;
+                }
+            }
+        }
+    }
+    drop(index);
+    let mut ready: BinaryHeap<Reverse<usize>> = BinaryHeap::new();
+    for (i, &d) in indeg.iter().enumerate() {
+        if d == 0 {
+            ready.push(Reverse(i));
+        }
+    }
+    let mut order = Vec::with_capacity(n);
+    while let Some(Reverse(i)) = ready.pop() {
+        order.push(i);
+        for &k in &succ[i] {
+            indeg[k] -= 1;
+            if indeg[k] == 0 {
+                ready.push(Reverse(k));
+            }
+        }
+    }
+    if order.len() != n {
+        return Err(params);
+    }
+    let mut slots: Vec<Option<ffi::Param>> = params.into_iter().map(Some).collect();
+    let mut out = Vec::with_capacity(n);
+    for i in order {
+        out.push(slots[i].take().expect("each source index appears once"));
+    }
+    Ok(out)
+}
+
+/// Order a parameter list, surfacing a cycle through `errors` (a synthetic,
+/// zero-width `ParseError` — the FFI carries no message channel) while keeping
+/// the parameters in source order rather than dropping them.
+fn ordered(params: Vec<ffi::Param>, errors: &mut Vec<ffi::ParseError>) -> Vec<ffi::Param> {
+    match order_params(params) {
+        Ok(p) => p,
+        Err(orig) => {
+            errors.push(ffi::ParseError { start: 0, end: 0 });
+            orig
+        }
     }
 }
 
-fn project_instance(i: &sast::Instance) -> ffi::Instance {
+// --- element projections ---
+
+fn project_param(p: &sast::Parameter, scope: &HashSet<String>) -> ffi::Param {
+    ffi::Param {
+        name: tok_text(p.name()),
+        value: rewrite_temp(&p.value_text().unwrap_or_default(), false, scope),
+    }
+}
+
+fn project_instance(i: &sast::Instance, scope: &HashSet<String>) -> ffi::Instance {
     ffi::Instance {
         name: tok_text(i.name()),
         master: tok_text(i.master()),
         nodes: i.nodes().iter().map(sast::SNode::path).collect(),
-        params: i.params().map(|p| project_param(&p)).collect(),
+        params: i.params().map(|p| project_param(&p, scope)).collect(),
     }
 }
 
-fn project_model(m: &sast::Model) -> ffi::Model {
+fn project_model(m: &sast::Model, scope: &HashSet<String>) -> ffi::Model {
     ffi::Model {
         name: tok_text(m.name()),
         master: tok_text(m.master()),
-        params: m.params().map(|p| project_param(&p)).collect(),
+        params: m.params().map(|p| project_param(&p, scope)).collect(),
     }
 }
 
-fn project_analysis(a: &sast::Analysis) -> ffi::Analysis {
+fn project_analysis(a: &sast::Analysis, scope: &HashSet<String>) -> ffi::Analysis {
     ffi::Analysis {
         name: tok_text(a.name()),
         analysis_type: tok_text(a.analysis_type()),
         nodes: a.nodes().iter().map(sast::SNode::path).collect(),
-        params: a.params().map(|p| project_param(&p)).collect(),
+        params: a.params().map(|p| project_param(&p, scope)).collect(),
     }
 }
 
-fn project_function(f: &sast::FunctionDecl) -> ffi::FunctionDef {
+fn project_function(f: &sast::FunctionDecl, scope: &HashSet<String>) -> ffi::FunctionDef {
+    // Function arguments are visible in the body: a `temp` argument keeps its
+    // binding, so extend the scope with them.
+    let mut body_scope = scope.clone();
+    let args: Vec<String> = f.args().iter().map(|a| tok_text(a.name())).collect();
+    for a in &args {
+        body_scope.insert(a.clone());
+    }
     ffi::FunctionDef {
         name: tok_text(f.name()),
-        args: f.args().iter().map(|a| tok_text(a.name())).collect(),
-        body: f.return_expr().unwrap_or_default(),
+        args,
+        body: rewrite_temp(&f.return_expr().unwrap_or_default(), false, &body_scope),
     }
 }
 
 /// Project a clause body (an iterator of statement nodes) into a `Block`.
-fn project_block(stmts: impl Iterator<Item = SyntaxNode>) -> ffi::Block {
-    let scope = collect_scope(stmts);
+fn project_block(
+    stmts: impl Iterator<Item = SyntaxNode>,
+    inherited: &HashSet<String>,
+    errors: &mut Vec<ffi::ParseError>,
+) -> ffi::Block {
+    let scope = collect_scope(stmts, inherited, errors);
     ffi::Block {
         params: scope.params,
         models: scope.models,
@@ -321,31 +601,39 @@ fn project_block(stmts: impl Iterator<Item = SyntaxNode>) -> ffi::Block {
     }
 }
 
-fn project_conditional(c: &sast::ConditionalBlock) -> ffi::Conditional {
+fn project_conditional(
+    c: &sast::ConditionalBlock,
+    scope: &HashSet<String>,
+    errors: &mut Vec<ffi::ParseError>,
+) -> ffi::Conditional {
     let mut clauses = Vec::new();
     if let Some(iff) = c.if_clause() {
         clauses.push(ffi::CondClause {
-            condition: iff.condition().unwrap_or_default(),
-            body: project_block(iff.body()),
+            condition: rewrite_temp(&iff.condition().unwrap_or_default(), false, scope),
+            body: project_block(iff.body(), scope, errors),
         });
     }
     for ei in c.else_ifs() {
         clauses.push(ffi::CondClause {
-            condition: ei.condition().unwrap_or_default(),
-            body: project_block(ei.body()),
+            condition: rewrite_temp(&ei.condition().unwrap_or_default(), false, scope),
+            body: project_block(ei.body(), scope, errors),
         });
     }
     if let Some(els) = c.else_clause() {
         clauses.push(ffi::CondClause {
             condition: String::new(),
-            body: project_block(els.body()),
+            body: project_block(els.body(), scope, errors),
         });
     }
     ffi::Conditional { clauses }
 }
 
-fn project_subckt(s: &sast::Subckt) -> ffi::Subckt {
-    let scope = collect_scope(s.body());
+fn project_subckt(
+    s: &sast::Subckt,
+    inherited: &HashSet<String>,
+    errors: &mut Vec<ffi::ParseError>,
+) -> ffi::Subckt {
+    let scope = collect_scope(s.body(), inherited, errors);
     ffi::Subckt {
         name: tok_text(s.name()),
         is_inline: s.is_inline(),
@@ -368,10 +656,14 @@ fn hier_text(h: Option<ast::HierarchialNode>) -> String {
 }
 
 /// Project a SPICE `Parameter` (name-only or `name=value`).
-fn project_spice_param(p: &ast::Parameter) -> ffi::Param {
+fn project_spice_param(p: &ast::Parameter, scope: &HashSet<String>) -> ffi::Param {
     ffi::Param {
         name: tok_text(p.name()),
-        value: p.value().map(|e| e.text()).unwrap_or_default(),
+        value: rewrite_temp(
+            &p.value().map(|e| e.text()).unwrap_or_default(),
+            true,
+            scope,
+        ),
     }
 }
 
@@ -415,25 +707,43 @@ fn empty_source() -> ffi::SpiceSource {
 
 /// Build a `SpiceSource` by walking the `DCSource`/`ACSource`/`TranSource`
 /// child nodes yielded by `Voltage::sources()` or `Current::sources()`.
-fn project_spice_source(sources: impl Iterator<Item = SyntaxNode>) -> ffi::SpiceSource {
+fn project_spice_source(
+    sources: impl Iterator<Item = SyntaxNode>,
+    scope: &HashSet<String>,
+) -> ffi::SpiceSource {
     let mut out = empty_source();
     for src in sources {
         match src.kind() {
             SyntaxKind::DCSource => {
                 if let Some(dc) = ast::DCSource::cast(src) {
-                    out.dc = dc.value().map(|e| e.text()).unwrap_or_default();
+                    out.dc = rewrite_temp(
+                        &dc.value().map(|e| e.text()).unwrap_or_default(),
+                        true,
+                        scope,
+                    );
                 }
             }
             SyntaxKind::ACSource => {
                 if let Some(ac) = ast::ACSource::cast(src) {
-                    out.ac_mag = ac.magnitude().map(|e| e.text()).unwrap_or_default();
-                    out.ac_phase = ac.phase().map(|e| e.text()).unwrap_or_default();
+                    out.ac_mag = rewrite_temp(
+                        &ac.magnitude().map(|e| e.text()).unwrap_or_default(),
+                        true,
+                        scope,
+                    );
+                    out.ac_phase = rewrite_temp(
+                        &ac.phase().map(|e| e.text()).unwrap_or_default(),
+                        true,
+                        scope,
+                    );
                 }
             }
             SyntaxKind::TranSource => {
                 if let Some(tran) = ast::TranSource::cast(src) {
                     out.tran_kind = tok_text(tran.function());
-                    out.tran_args = tran.values().map(|e| e.text()).collect();
+                    out.tran_args = tran
+                        .values()
+                        .map(|e| rewrite_temp(&e.text(), true, scope))
+                        .collect();
                 }
             }
             _ => {}
@@ -447,15 +757,19 @@ fn project_spice_source(sources: impl Iterator<Item = SyntaxNode>) -> ffi::Spice
 ///
 /// This helper is shared by `project_spice_block` and `project_spice_subckt`
 /// so that subckt bodies receive the same device coverage as the top-level block.
-fn project_spice_device(child: SyntaxNode) -> Option<ffi::SpiceDevice> {
+fn project_spice_device(child: SyntaxNode, scope: &HashSet<String>) -> Option<ffi::SpiceDevice> {
     match child.kind() {
         SyntaxKind::Resistor => ast::Resistor::cast(child).map(|r| ffi::SpiceDevice {
             kind: ffi::SpiceDeviceKind::Resistor,
             name: hier_text(r.name()),
             nodes: vec![hier_text(r.pos()), hier_text(r.neg())],
-            value: r.value().map(|e| e.text()).unwrap_or_default(),
+            value: rewrite_temp(
+                &r.value().map(|e| e.text()).unwrap_or_default(),
+                true,
+                scope,
+            ),
             model: String::new(),
-            params: r.params().map(|p| project_spice_param(&p)).collect(),
+            params: r.params().map(|p| project_spice_param(&p, scope)).collect(),
             ctrl_nodes: vec![],
             ctrl_value: String::new(),
             source: empty_source(),
@@ -464,9 +778,13 @@ fn project_spice_device(child: SyntaxNode) -> Option<ffi::SpiceDevice> {
             kind: ffi::SpiceDeviceKind::Capacitor,
             name: hier_text(c.name()),
             nodes: vec![hier_text(c.pos()), hier_text(c.neg())],
-            value: c.value().map(|e| e.text()).unwrap_or_default(),
+            value: rewrite_temp(
+                &c.value().map(|e| e.text()).unwrap_or_default(),
+                true,
+                scope,
+            ),
             model: String::new(),
-            params: c.params().map(|p| project_spice_param(&p)).collect(),
+            params: c.params().map(|p| project_spice_param(&p, scope)).collect(),
             ctrl_nodes: vec![],
             ctrl_value: String::new(),
             source: empty_source(),
@@ -475,9 +793,13 @@ fn project_spice_device(child: SyntaxNode) -> Option<ffi::SpiceDevice> {
             kind: ffi::SpiceDeviceKind::Inductor,
             name: hier_text(l.name()),
             nodes: vec![hier_text(l.pos()), hier_text(l.neg())],
-            value: l.value().map(|e| e.text()).unwrap_or_default(),
+            value: rewrite_temp(
+                &l.value().map(|e| e.text()).unwrap_or_default(),
+                true,
+                scope,
+            ),
             model: String::new(),
-            params: l.params().map(|p| project_spice_param(&p)).collect(),
+            params: l.params().map(|p| project_spice_param(&p, scope)).collect(),
             ctrl_nodes: vec![],
             ctrl_value: String::new(),
             source: empty_source(),
@@ -491,7 +813,7 @@ fn project_spice_device(child: SyntaxNode) -> Option<ffi::SpiceDevice> {
             params: vec![],
             ctrl_nodes: vec![],
             ctrl_value: String::new(),
-            source: project_spice_source(v.sources()),
+            source: project_spice_source(v.sources(), scope),
         }),
         SyntaxKind::Current => ast::Current::cast(child).map(|i| ffi::SpiceDevice {
             kind: ffi::SpiceDeviceKind::ISource,
@@ -502,7 +824,7 @@ fn project_spice_device(child: SyntaxNode) -> Option<ffi::SpiceDevice> {
             params: vec![],
             ctrl_nodes: vec![],
             ctrl_value: String::new(),
-            source: project_spice_source(i.sources()),
+            source: project_spice_source(i.sources(), scope),
         }),
         SyntaxKind::Diode => ast::Diode::cast(child).map(|d| ffi::SpiceDevice {
             kind: ffi::SpiceDeviceKind::Diode,
@@ -510,7 +832,7 @@ fn project_spice_device(child: SyntaxNode) -> Option<ffi::SpiceDevice> {
             nodes: vec![hier_text(d.pos()), hier_text(d.neg())],
             value: String::new(),
             model: hier_text(d.model()),
-            params: d.params().map(|p| project_spice_param(&p)).collect(),
+            params: d.params().map(|p| project_spice_param(&p, scope)).collect(),
             ctrl_nodes: vec![],
             ctrl_value: String::new(),
             source: empty_source(),
@@ -526,7 +848,7 @@ fn project_spice_device(child: SyntaxNode) -> Option<ffi::SpiceDevice> {
             ],
             value: String::new(),
             model: hier_text(m.model()),
-            params: m.params().map(|p| project_spice_param(&p)).collect(),
+            params: m.params().map(|p| project_spice_param(&p, scope)).collect(),
             ctrl_nodes: vec![],
             ctrl_value: String::new(),
             source: empty_source(),
@@ -551,7 +873,7 @@ fn project_spice_device(child: SyntaxNode) -> Option<ffi::SpiceDevice> {
                 nodes: terminals,
                 value: String::new(),
                 model,
-                params: q.params().map(|p| project_spice_param(&p)).collect(),
+                params: q.params().map(|p| project_spice_param(&p, scope)).collect(),
                 ctrl_nodes: vec![],
                 ctrl_value: String::new(),
                 source: empty_source(),
@@ -575,7 +897,7 @@ fn project_spice_device(child: SyntaxNode) -> Option<ffi::SpiceDevice> {
                 nodes: conn_nodes,
                 value: String::new(),
                 model,
-                params: x.params().map(|p| project_spice_param(&p)).collect(),
+                params: x.params().map(|p| project_spice_param(&p, scope)).collect(),
                 ctrl_nodes: vec![],
                 ctrl_value: String::new(),
                 source: empty_source(),
@@ -607,9 +929,11 @@ fn project_spice_device(child: SyntaxNode) -> Option<ffi::SpiceDevice> {
                         if let Some(vc) = ast::VoltageControl::cast(ctrl) {
                             let cnodes: Vec<String> =
                                 vc.control_nodes().map(|n| n.text()).collect();
-                            let cval = ctrl_value_text(vc.syntax());
-                            let ps: Vec<ffi::Param> =
-                                vc.params().map(|p| project_spice_param(&p)).collect();
+                            let cval = rewrite_temp(&ctrl_value_text(vc.syntax()), true, scope);
+                            let ps: Vec<ffi::Param> = vc
+                                .params()
+                                .map(|p| project_spice_param(&p, scope))
+                                .collect();
                             (cnodes, cval, ps)
                         } else {
                             (vec![], String::new(), vec![])
@@ -618,16 +942,22 @@ fn project_spice_device(child: SyntaxNode) -> Option<ffi::SpiceDevice> {
                     SyntaxKind::CurrentControl => {
                         if let Some(cc) = ast::CurrentControl::cast(ctrl) {
                             let vnam = hier_text(cc.vnam());
-                            let cval = ctrl_value_text(cc.syntax());
-                            let ps: Vec<ffi::Param> =
-                                cc.params().map(|p| project_spice_param(&p)).collect();
+                            let cval = rewrite_temp(&ctrl_value_text(cc.syntax()), true, scope);
+                            let ps: Vec<ffi::Param> = cc
+                                .params()
+                                .map(|p| project_spice_param(&p, scope))
+                                .collect();
                             (vec![vnam], cval, ps)
                         } else {
                             (vec![], String::new(), vec![])
                         }
                     }
                     // POLY/TABLE: capture full node text as ctrl_value (deferred).
-                    _ => (vec![], ctrl.text().to_string(), vec![]),
+                    _ => (
+                        vec![],
+                        rewrite_temp(&ctrl.text().to_string(), true, scope),
+                        vec![],
+                    ),
                 },
                 None => (vec![], String::new(), vec![]),
             };
@@ -648,7 +978,7 @@ fn project_spice_device(child: SyntaxNode) -> Option<ffi::SpiceDevice> {
         // nodes = [L1, L2, ...]; coupling value stored in `value`.
         SyntaxKind::MutualInductor => ast::MutualInductor::cast(child).map(|k| {
             let nodes: Vec<String> = k.inductors().map(|n| n.text()).collect();
-            let coupling = ctrl_value_text(k.syntax());
+            let coupling = rewrite_temp(&ctrl_value_text(k.syntax()), true, scope);
             ffi::SpiceDevice {
                 kind: ffi::SpiceDeviceKind::MutualInductor,
                 name: hier_text(k.name()),
@@ -686,7 +1016,7 @@ fn project_spice_device(child: SyntaxNode) -> Option<ffi::SpiceDevice> {
             nodes: vec![hier_text(b.pos()), hier_text(b.neg())],
             value: String::new(),
             model: String::new(),
-            params: b.params().map(|p| project_spice_param(&p)).collect(),
+            params: b.params().map(|p| project_spice_param(&p, scope)).collect(),
             ctrl_nodes: vec![],
             ctrl_value: String::new(),
             source: empty_source(),
@@ -702,9 +1032,9 @@ fn project_spice_device(child: SyntaxNode) -> Option<ffi::SpiceDevice> {
                 hier_text(j.gate()),
                 hier_text(j.source()),
             ],
-            value: j.area().map(|e| e.text()).unwrap_or_default(),
+            value: rewrite_temp(&j.area().map(|e| e.text()).unwrap_or_default(), true, scope),
             model: hier_text(j.model()),
-            params: j.params().map(|p| project_spice_param(&p)).collect(),
+            params: j.params().map(|p| project_spice_param(&p, scope)).collect(),
             ctrl_nodes: vec![],
             ctrl_value: String::new(),
             source: empty_source(),
@@ -726,7 +1056,7 @@ fn project_spice_device(child: SyntaxNode) -> Option<ffi::SpiceDevice> {
                 nodes: terminals,
                 value: String::new(),
                 model,
-                params: n.params().map(|p| project_spice_param(&p)).collect(),
+                params: n.params().map(|p| project_spice_param(&p, scope)).collect(),
                 ctrl_nodes: vec![],
                 ctrl_value: String::new(),
                 source: empty_source(),
@@ -739,8 +1069,8 @@ fn project_spice_device(child: SyntaxNode) -> Option<ffi::SpiceDevice> {
 
 /// Project a SPICE `.model` card into a `SpiceModel`.
 /// Extracts `level` from the params list if present (case-insensitive match).
-fn project_spice_model(m: &ast::Model) -> ffi::SpiceModel {
-    let params: Vec<ffi::Param> = m.params().map(|p| project_spice_param(&p)).collect();
+fn project_spice_model(m: &ast::Model, scope: &HashSet<String>) -> ffi::SpiceModel {
+    let params: Vec<ffi::Param> = m.params().map(|p| project_spice_param(&p, scope)).collect();
     let level = params
         .iter()
         .find(|p| p.name.eq_ignore_ascii_case("level"))
@@ -756,17 +1086,25 @@ fn project_spice_model(m: &ast::Model) -> ffi::SpiceModel {
 
 /// Preserve each branch as its own scope. Conditions depend on the eventual
 /// instance parameters, so projecting must neither evaluate nor flatten them.
-fn project_spice_conditional(c: &ast::IfBlock) -> ffi::SpiceConditional {
+fn project_spice_conditional(
+    c: &ast::IfBlock,
+    scope: &HashSet<String>,
+    errors: &mut Vec<ffi::ParseError>,
+) -> ffi::SpiceConditional {
     ffi::SpiceConditional {
         clauses: c
             .cases()
             .map(|clause| ffi::SpiceCondClause {
-                condition: clause
-                    .condition()
-                    .and_then(|condition| condition.expr())
-                    .map(|expr| expr.text().trim().to_string())
-                    .unwrap_or_default(),
-                body: project_spice_block_children(clause.body()),
+                condition: rewrite_temp(
+                    &clause
+                        .condition()
+                        .and_then(|condition| condition.expr())
+                        .map(|expr| expr.text().trim().to_string())
+                        .unwrap_or_default(),
+                    true,
+                    scope,
+                ),
+                body: project_spice_block_children(clause.body(), scope, errors),
             })
             .collect(),
     }
@@ -774,14 +1112,27 @@ fn project_spice_conditional(c: &ast::IfBlock) -> ffi::SpiceConditional {
 
 /// Project a SPICE `.subckt` without moving branch bodies or includes out of
 /// their defining scope. Include resolution is the consumer's responsibility.
-fn project_spice_subckt(s: &ast::Subckt) -> ffi::SpiceSubckt {
-    let body = project_spice_block_children(s.body());
-    // Formal params from the `.subckt` header (e.g. `w=1 l=1`). Internal
-    // `.param` statements from the body are appended below, after the formal
-    // params, so downstream sees them in source order (body params may depend
-    // on the formal ones).
-    let mut params: Vec<ffi::Param> = s.params().map(|p| project_spice_param(&p)).collect();
+fn project_spice_subckt(
+    s: &ast::Subckt,
+    inherited: &HashSet<String>,
+    errors: &mut Vec<ffi::ParseError>,
+) -> ffi::SpiceSubckt {
+    // Formal header params (`.subckt … w=1 l=1`) are visible to the body, so
+    // seed the body scope with them.
+    let header: Vec<ast::Parameter> = s.params().collect();
+    let mut scope = inherited.clone();
+    for p in &header {
+        scope.insert(tok_text(p.name()).to_ascii_lowercase());
+    }
+    let body = project_spice_block_children(s.body(), &scope, errors);
+    // Formal params first, then body `.param` statements, then ordered so each
+    // expression follows the parameters it references.
+    let mut params: Vec<ffi::Param> = header
+        .iter()
+        .map(|p| project_spice_param(p, &scope))
+        .collect();
     params.extend(body.params);
+    let params = ordered(params, errors);
     ffi::SpiceSubckt {
         name: tok_text(s.name()),
         ports: s.ports().map(|p| p.text()).collect(),
@@ -794,9 +1145,44 @@ fn project_spice_subckt(s: &ast::Subckt) -> ffi::SpiceSubckt {
     }
 }
 
+/// Collect SPICE `.param` names declared in a scope (including inside `.if`
+/// clause bodies), lowercased because SPICE identifiers are case-folded.
+fn collect_spice_param_names(children: &[SyntaxNode], out: &mut HashSet<String>) {
+    for child in children {
+        match child.kind() {
+            SyntaxKind::ParamStatement => {
+                if let Some(ps) = ast::ParamStatement::cast(child.clone()) {
+                    for p in ps.params() {
+                        out.insert(tok_text(p.name()).to_ascii_lowercase());
+                    }
+                }
+            }
+            SyntaxKind::IfBlock => {
+                if let Some(c) = ast::IfBlock::cast(child.clone()) {
+                    for clause in c.cases() {
+                        let body: Vec<SyntaxNode> = clause.body().collect();
+                        collect_spice_param_names(&body, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Project an iterator of SPICE children (params, models, subckts, devices,
 /// includes, conditionals) into a `SpiceBlock`.
-fn project_spice_block_children(children: impl Iterator<Item = SyntaxNode>) -> ffi::SpiceBlock {
+fn project_spice_block_children(
+    children: impl Iterator<Item = SyntaxNode>,
+    inherited: &HashSet<String>,
+    errors: &mut Vec<ffi::ParseError>,
+) -> ffi::SpiceBlock {
+    let children: Vec<SyntaxNode> = children.collect();
+    // `.param` declarations (including those inside `.if` clause bodies) are
+    // visible to every expression in this scope.
+    let mut scope = inherited.clone();
+    collect_spice_param_names(&children, &mut scope);
+
     let mut block = ffi::SpiceBlock {
         params: vec![],
         models: vec![],
@@ -805,27 +1191,27 @@ fn project_spice_block_children(children: impl Iterator<Item = SyntaxNode>) -> f
         includes: vec![],
         conditionals: vec![],
     };
-    for child in children {
+    for child in &children {
         match child.kind() {
             SyntaxKind::ParamStatement => {
-                if let Some(ps) = ast::ParamStatement::cast(child) {
+                if let Some(ps) = ast::ParamStatement::cast(child.clone()) {
                     for p in ps.params() {
-                        block.params.push(project_spice_param(&p));
+                        block.params.push(project_spice_param(&p, &scope));
                     }
                 }
             }
             SyntaxKind::Model => {
-                if let Some(m) = ast::Model::cast(child) {
-                    block.models.push(project_spice_model(&m));
+                if let Some(m) = ast::Model::cast(child.clone()) {
+                    block.models.push(project_spice_model(&m, &scope));
                 }
             }
             SyntaxKind::Subckt => {
-                if let Some(s) = ast::Subckt::cast(child) {
-                    block.subckts.push(project_spice_subckt(&s));
+                if let Some(s) = ast::Subckt::cast(child.clone()) {
+                    block.subckts.push(project_spice_subckt(&s, &scope, errors));
                 }
             }
             SyntaxKind::IncludeStatement => {
-                if let Some(inc) = ast::IncludeStatement::cast(child) {
+                if let Some(inc) = ast::IncludeStatement::cast(child.clone()) {
                     block.includes.push(ffi::Include {
                         path: unquote(&tok_text(inc.path())),
                         section: String::new(),
@@ -833,7 +1219,7 @@ fn project_spice_block_children(children: impl Iterator<Item = SyntaxNode>) -> f
                 }
             }
             SyntaxKind::LibInclude => {
-                if let Some(lib) = ast::LibInclude::cast(child) {
+                if let Some(lib) = ast::LibInclude::cast(child.clone()) {
                     block.includes.push(ffi::Include {
                         path: unquote(&tok_text(lib.path())),
                         section: tok_text(lib.section()),
@@ -841,25 +1227,28 @@ fn project_spice_block_children(children: impl Iterator<Item = SyntaxNode>) -> f
                 }
             }
             SyntaxKind::IfBlock => {
-                if let Some(conditional) = ast::IfBlock::cast(child) {
-                    block
-                        .conditionals
-                        .push(project_spice_conditional(&conditional));
+                if let Some(conditional) = ast::IfBlock::cast(child.clone()) {
+                    block.conditionals.push(project_spice_conditional(
+                        &conditional,
+                        &scope,
+                        errors,
+                    ));
                 }
             }
             _ => {
-                if let Some(dev) = project_spice_device(child) {
+                if let Some(dev) = project_spice_device(child.clone(), &scope) {
                     block.devices.push(dev);
                 }
             }
         }
     }
+    block.params = ordered(block.params, errors);
     block
 }
 
 /// Project a `SPICENetlistSource` node into a `SpiceBlock`.
-fn project_spice_block(node: SyntaxNode) -> ffi::SpiceBlock {
-    project_spice_block_children(node.children())
+fn project_spice_block(node: SyntaxNode, errors: &mut Vec<ffi::ParseError>) -> ffi::SpiceBlock {
+    project_spice_block_children(node.children(), &HashSet::new(), errors)
 }
 
 /// The definition-level content shared by a netlist and a subckt body.
@@ -880,48 +1269,117 @@ struct Scope {
     functions: Vec<ffi::FunctionDef>,
 }
 
-fn collect_scope(stmts: impl Iterator<Item = SyntaxNode>) -> Scope {
-    let mut scope = Scope::default();
+/// Collect parameter names declared inside conditional clause bodies straight
+/// from the syntax tree (before projection), so the enclosing definition's
+/// rewrite scope already contains them.
+fn collect_conditional_names_from_ast(stmts: &[SyntaxNode], out: &mut HashSet<String>) {
+    for stmt in stmts {
+        if let Some(c) = sast::ConditionalBlock::cast(stmt.clone()) {
+            for body in conditional_clause_bodies(&c) {
+                for s in &body {
+                    if s.kind() == SyntaxKind::Parameters {
+                        if let Some(p) = sast::Parameters::cast(s.clone()) {
+                            for prm in p.params() {
+                                if let Some(t) = prm.name() {
+                                    out.insert(t.text().to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                collect_conditional_names_from_ast(&body, out);
+            }
+        }
+    }
+}
+
+/// The statement bodies of every clause of a conditional block, in source order.
+fn conditional_clause_bodies(c: &sast::ConditionalBlock) -> Vec<Vec<SyntaxNode>> {
+    let mut bodies = Vec::new();
+    if let Some(iff) = c.if_clause() {
+        bodies.push(iff.body().collect());
+    }
+    for ei in c.else_ifs() {
+        bodies.push(ei.body().collect());
+    }
+    if let Some(els) = c.else_clause() {
+        bodies.push(els.body().collect());
+    }
+    bodies
+}
+
+fn collect_scope(
+    stmts: impl Iterator<Item = SyntaxNode>,
+    inherited: &HashSet<String>,
+    errors: &mut Vec<ffi::ParseError>,
+) -> Scope {
+    let stmts: Vec<SyntaxNode> = stmts.collect();
+
+    // Visible parameter names: this definition's `parameters` plus any declared
+    // inside its conditional clauses. A parameter of that name shadows the
+    // `temp` builtin for every expression in this definition.
+    let mut scope_names = inherited.clone();
+    for stmt in &stmts {
+        if stmt.kind() == SyntaxKind::Parameters {
+            if let Some(p) = sast::Parameters::cast(stmt.clone()) {
+                for prm in p.params() {
+                    if let Some(t) = prm.name() {
+                        scope_names.insert(t.text().to_string());
+                    }
+                }
+            }
+        }
+    }
+    collect_conditional_names_from_ast(&stmts, &mut scope_names);
+    let scope = &scope_names;
+
+    let mut collected = Scope::default();
     for stmt in stmts {
         match stmt.kind() {
             SyntaxKind::Model => {
                 if let Some(m) = sast::Model::cast(stmt) {
-                    scope.models.push(project_model(&m));
+                    collected.models.push(project_model(&m, scope));
                 }
             }
             SyntaxKind::Instance => {
                 if let Some(i) = sast::Instance::cast(stmt) {
-                    scope.instances.push(project_instance(&i));
+                    collected.instances.push(project_instance(&i, scope));
                 }
             }
             SyntaxKind::Subckt => {
                 if let Some(s) = sast::Subckt::cast(stmt) {
-                    scope.subckts.push(project_subckt(&s));
+                    collected.subckts.push(project_subckt(&s, scope, errors));
                 }
             }
             SyntaxKind::FunctionDecl => {
                 if let Some(f) = sast::FunctionDecl::cast(stmt) {
-                    scope.functions.push(project_function(&f));
+                    collected.functions.push(project_function(&f, scope));
                 }
             }
             SyntaxKind::Parameters => {
                 if let Some(p) = sast::Parameters::cast(stmt) {
-                    scope.params.extend(p.params().map(|p| project_param(&p)));
+                    collected
+                        .params
+                        .extend(p.params().map(|p| project_param(&p, scope)));
                 }
             }
+            // Conditionals are projected with the definition's full scope,
+            // which already includes their own parameter declarations.
             SyntaxKind::ConditionalBlock => {
                 if let Some(c) = sast::ConditionalBlock::cast(stmt) {
-                    scope.conditionals.push(project_conditional(&c));
+                    collected
+                        .conditionals
+                        .push(project_conditional(&c, scope, errors));
                 }
             }
             SyntaxKind::Analysis => {
                 if let Some(a) = sast::Analysis::cast(stmt) {
-                    scope.analyses.push(project_analysis(&a));
+                    collected.analyses.push(project_analysis(&a, scope));
                 }
             }
             SyntaxKind::Save => {
                 if let Some(s) = sast::Save::cast(stmt) {
-                    scope.saves.extend(s.signals().map(|sig| ffi::SaveItem {
+                    collected.saves.extend(s.signals().map(|sig| ffi::SaveItem {
                         signal: sig.node().map(|n| n.path()).unwrap_or_default(),
                         modifier: sig.modifier().and_then(|m| m.value()).unwrap_or_default(),
                     }));
@@ -929,7 +1387,7 @@ fn collect_scope(stmts: impl Iterator<Item = SyntaxNode>) -> Scope {
             }
             SyntaxKind::Ic => {
                 if let Some(ic) = sast::Ic::cast(stmt) {
-                    scope.ics.extend(ic.params().map(|p| ffi::IcItem {
+                    collected.ics.extend(ic.params().map(|p| ffi::IcItem {
                         node: p.node().map(|n| n.path()).unwrap_or_default(),
                         value: p.value_text().unwrap_or_default(),
                     }));
@@ -937,12 +1395,12 @@ fn collect_scope(stmts: impl Iterator<Item = SyntaxNode>) -> Scope {
             }
             SyntaxKind::Global => {
                 if let Some(g) = sast::Global::cast(stmt) {
-                    scope.globals.extend(g.nodes().map(|n| n.path()));
+                    collected.globals.extend(g.nodes().map(|n| n.path()));
                 }
             }
             SyntaxKind::Include => {
                 if let Some(inc) = sast::Include::cast(stmt) {
-                    scope.includes.push(ffi::Include {
+                    collected.includes.push(ffi::Include {
                         path: unquote(&tok_text(inc.path())),
                         section: inc
                             .section()
@@ -954,16 +1412,21 @@ fn collect_scope(stmts: impl Iterator<Item = SyntaxNode>) -> Scope {
             }
             SyntaxKind::AHDLInclude => {
                 if let Some(a) = sast::AHDLInclude::cast(stmt) {
-                    scope.ahdl_includes.push(unquote(&tok_text(a.path())));
+                    collected.ahdl_includes.push(unquote(&tok_text(a.path())));
                 }
             }
             SyntaxKind::SPICENetlistSource => {
-                scope.spice_blocks.push(project_spice_block(stmt));
+                let mut inner = Vec::new();
+                collected
+                    .spice_blocks
+                    .push(project_spice_block(stmt, &mut inner));
+                errors.extend(inner);
             }
             _ => {}
         }
     }
-    scope
+    collected.params = ordered(collected.params, errors);
+    collected
 }
 
 fn collect_errors(root: &SyntaxNode) -> Vec<ffi::ParseError> {
@@ -1075,10 +1538,10 @@ pub fn parse_netlist(src: &str, language: &str) -> ffi::Netlist {
         None => return lang_error_netlist(),
     };
     let root = parse_spectre_with(src, start_lang, dialect);
-    let errors = collect_errors(&root);
+    let mut errors = collect_errors(&root);
     let incompletes = collect_incompletes(&root);
     let source = sast::SpectreNetlistSource::cast(root).expect("root is SpectreNetlistSource");
-    let scope = collect_scope(source.statements());
+    let scope = collect_scope(source.statements(), &HashSet::new(), &mut errors);
     netlist_from_scope(scope, errors, incompletes)
 }
 
@@ -1097,7 +1560,7 @@ pub fn parse_netlist_lib(src: &str, section: &str, language: &str) -> ffi::Netli
 
 fn parse_spice_lib(src: &str, section: &str, dialect: Dialect) -> ffi::Netlist {
     let root = parse_spice_dialect(src, dialect);
-    let errors = collect_errors(&root);
+    let mut errors = collect_errors(&root);
     let incompletes = collect_incompletes(&root);
 
     let mut block = ffi::SpiceBlock {
@@ -1113,7 +1576,11 @@ fn parse_spice_lib(src: &str, section: &str, dialect: Dialect) -> ffi::Netlist {
             if let Some(lib) = ast::LibStatement::cast(child) {
                 let name = tok_text(lib.name());
                 if name.eq_ignore_ascii_case(section) {
-                    let inner = project_spice_block_children(lib.statements());
+                    let inner = project_spice_block_children(
+                        lib.statements(),
+                        &HashSet::new(),
+                        &mut errors,
+                    );
                     block.params.extend(inner.params);
                     block.models.extend(inner.models);
                     block.subckts.extend(inner.subckts);
@@ -1124,6 +1591,7 @@ fn parse_spice_lib(src: &str, section: &str, dialect: Dialect) -> ffi::Netlist {
             }
         }
     }
+    block.params = ordered(block.params, &mut errors);
 
     let mut nl = empty_netlist();
     nl.spice_blocks.push(block);
@@ -1142,7 +1610,7 @@ fn spectre_section_matches(sec: &sast::Section, wanted: &str) -> bool {
 
 fn parse_spectre_lib(src: &str, section: &str) -> ffi::Netlist {
     let root = parse_spectre_with(src, StartLang::Spectre, Dialect::Ngspice);
-    let errors = collect_errors(&root);
+    let mut errors = collect_errors(&root);
     let incompletes = collect_incompletes(&root);
     let source = sast::SpectreNetlistSource::cast(root).expect("root is SpectreNetlistSource");
 
@@ -1171,7 +1639,7 @@ fn parse_spectre_lib(src: &str, section: &str) -> ffi::Netlist {
         }
     }
 
-    let scope = collect_scope(selected.into_iter());
+    let scope = collect_scope(selected.into_iter(), &HashSet::new(), &mut errors);
     netlist_from_scope(scope, errors, incompletes)
 }
 
@@ -1838,6 +2306,287 @@ ends adnfet\n";
         assert!(
             nl.includes.is_empty(),
             "subckt include must not leak to top level"
+        );
+    }
+
+    // --- Change 1: dialect temperature builtins ---
+
+    #[test]
+    fn rewrites_spectre_temp_builtin_in_parameters() {
+        // A free `temp` becomes `$temp`; a call name that merely starts with
+        // `temp` is not touched, but a `temp` argument to another call is.
+        let nl = parse_netlist(
+            "simulator lang=spectre\nparameters tp=temp+25 rate=tempo(temp)\n",
+            "spectre",
+        );
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        let val = |name: &str| {
+            nl.params
+                .iter()
+                .find(|p| p.name == name)
+                .map(|p| p.value.clone())
+                .unwrap()
+        };
+        assert_eq!(val("tp"), "$temp+25");
+        assert_eq!(val("rate"), "tempo($temp)");
+    }
+
+    #[test]
+    fn declared_spectre_parameter_shadows_temp() {
+        let nl = parse_netlist(
+            "simulator lang=spectre\nparameters temp=300 vt=P_K*temp/P_Q\n",
+            "spectre",
+        );
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        // `temp` is declared, so it keeps its binding everywhere in the scope.
+        let tmp = nl.params.iter().find(|p| p.name == "temp").unwrap();
+        assert_eq!(tmp.value, "300");
+        let vt = nl.params.iter().find(|p| p.name == "vt").unwrap();
+        assert_eq!(vt.value, "P_K*temp/P_Q");
+        // Ordering must place `temp` before `vt` (which references it).
+        assert_eq!(
+            nl.params
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["temp", "vt"]
+        );
+    }
+
+    #[test]
+    fn spectre_temp_inside_access_or_string_is_untouched() {
+        // `temp` inside v()/i() names a node/branch; inside quotes it is a
+        // string literal. Neither is a free identifier.
+        let nl = parse_netlist(
+            "simulator lang=spectre\nparameters p1=v(temp) p2=i(temp) s=\"temp\"\n",
+            "spectre",
+        );
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        let val = |name: &str| {
+            nl.params
+                .iter()
+                .find(|p| p.name == name)
+                .map(|p| p.value.clone())
+                .unwrap()
+        };
+        assert_eq!(val("p1"), "v(temp)");
+        assert_eq!(val("p2"), "i(temp)");
+        assert_eq!(val("s"), "\"temp\"");
+    }
+
+    #[test]
+    fn spectre_temp_call_name_is_not_rewritten() {
+        let nl = parse_netlist("simulator lang=spectre\nparameters c=temp(1)\n", "spectre");
+        // The call name itself is a function, not the ambient-temperature builtin.
+        let c = nl.params.iter().find(|p| p.name == "c").unwrap();
+        assert_eq!(c.value, "temp(1)");
+    }
+
+    #[test]
+    fn spectre_temp_conditional_declaration_shadows() {
+        // A `temp` declared in a conditional clause joins the definition's
+        // translation namespace, so it shadows the builtin for the whole
+        // definition (mirroring the consumer's scope model).
+        let nl = parse_netlist(
+            "simulator lang=spectre\n\
+             parameters y=temp\n\
+             if (1) {\n\
+             parameters temp=1\n\
+             }\n",
+            "spectre",
+        );
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        let y = nl.params.iter().find(|p| p.name == "y").unwrap();
+        assert_eq!(y.value, "temp", "conditional declaration must shadow");
+        assert_eq!(nl.conditionals[0].clauses[0].body.params[0].value, "1");
+    }
+
+    #[test]
+    fn spectre_conditional_condition_is_rewritten() {
+        let nl = parse_netlist(
+            "simulator lang=spectre\n\
+             parameters x=1\n\
+             if (temp > 0) {\n\
+             r1 (a b) resistor r=1k\n\
+             }\n",
+            "spectre",
+        );
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        assert_eq!(nl.conditionals[0].clauses[0].condition, "$temp > 0");
+    }
+
+    #[test]
+    fn spectre_function_bodies_are_rewritten_with_arg_scope() {
+        let nl = parse_netlist(
+            "simulator lang=spectre\n\
+             real f(real a) {\n\
+             return a*temp ;\n\
+             }\n\
+             real g(real temp) {\n\
+             return temp*2 ;\n\
+             }\n",
+            "spectre",
+        );
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        let f = nl.functions.iter().find(|f| f.name == "f").unwrap();
+        assert_eq!(f.body, "a*$temp");
+        let g = nl.functions.iter().find(|f| f.name == "g").unwrap();
+        assert_eq!(g.body, "temp*2", "a `temp` argument keeps its binding");
+    }
+
+    #[test]
+    fn rewrite_temp_in_instance_and_model_params() {
+        let nl = parse_netlist(
+            "simulator lang=spectre\n\
+             model nch bsim4 tnom=temp\n\
+             x1 (a b) nch w=temp\n",
+            "spectre",
+        );
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        assert_eq!(nl.models[0].params[0].value, "$temp");
+        assert_eq!(nl.instances[0].params[0].value, "$temp");
+    }
+
+    #[test]
+    fn rewrites_spectre_temper_not_at_all() {
+        // Spectre's builtin is `temp`; `temper` is an ordinary identifier there.
+        let nl = parse_netlist("simulator lang=spectre\nparameters x=temper\n", "spectre");
+        assert_eq!(nl.params[0].value, "temper");
+    }
+
+    #[test]
+    fn rewrites_spice_temper_builtin() {
+        let nl = parse_netlist("* t\n.param tp=temper\nR1 a b tp\n", "ngspice");
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        let b = &nl.spice_blocks[0];
+        assert_eq!(b.params[0].name, "tp");
+        assert_eq!(b.params[0].value, "$temp");
+    }
+
+    #[test]
+    fn declared_spice_parameter_shadows_temper() {
+        let nl = parse_netlist(
+            "* t\n.param temper=27\n.param tp=temper\nR1 a b tp\n",
+            "ngspice",
+        );
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        let b = &nl.spice_blocks[0];
+        let tp = b.params.iter().find(|p| p.name == "tp").unwrap();
+        assert_eq!(tp.value, "temper", "declared `temper` keeps its binding");
+    }
+
+    #[test]
+    fn spice_native_temp_is_left_alone() {
+        // `temp` is not the SPICE builtin (that is `temper`) and only the SPECTRE
+        // dialect rewrites `temp`.
+        let nl = parse_netlist("* t\n.param t=temp\nR1 a b t\n", "ngspice");
+        let b = &nl.spice_blocks[0];
+        assert_eq!(b.params[0].value, "temp");
+    }
+
+    #[test]
+    fn spice_temper_in_device_and_model_params() {
+        let nl = parse_netlist(
+            "* t\nR1 a b 1k tc1=temper\n.model dm d is=temper\n",
+            "ngspice",
+        );
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        let b = &nl.spice_blocks[0];
+        assert_eq!(b.devices[0].params[0].value, "$temp");
+        assert_eq!(b.models[0].params[0].value, "$temp");
+    }
+
+    // --- Change 2: dependency-ordered parameter lists ---
+
+    #[test]
+    fn spectre_parameters_are_dependency_ordered() {
+        // `b` is declared before `a` but references it: ordering resolves the
+        // forward reference without touching the values.
+        let nl = parse_netlist("simulator lang=spectre\nparameters b=a*2 a=1\n", "spectre");
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        assert_eq!(
+            nl.params
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+    }
+
+    #[test]
+    fn spectre_independent_parameters_keep_source_order() {
+        let nl = parse_netlist(
+            "simulator lang=spectre\nparameters a=1 b=2 c=3\n",
+            "spectre",
+        );
+        assert_eq!(
+            nl.params
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
+    }
+
+    #[test]
+    fn spectre_self_reference_is_not_a_cycle() {
+        // `x=x+1` denotes the enclosing scope: no edge, so this is not a cycle
+        // and `x` is still ordered before `y`.
+        let nl = parse_netlist(
+            "simulator lang=spectre\nparameters y=x*2 x=x+1\n",
+            "spectre",
+        );
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        assert_eq!(
+            nl.params
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["x", "y"]
+        );
+        let x = nl.params.iter().find(|p| p.name == "x").unwrap();
+        assert_eq!(x.value, "x+1");
+    }
+
+    #[test]
+    fn spectre_parameter_cycle_is_reported() {
+        let nl = parse_netlist("simulator lang=spectre\nparameters a=b b=a\n", "spectre");
+        assert!(
+            !nl.errors.is_empty(),
+            "a parameter cycle must surface through the FFI errors field"
+        );
+        // Parameters are kept (in source order), not dropped.
+        assert_eq!(
+            nl.params
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+    }
+
+    #[test]
+    fn spice_parameters_are_dependency_ordered() {
+        let nl = parse_netlist("* t\n.param b=a*2\n.param a=1\nR1 x y b\n", "ngspice");
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        let b = &nl.spice_blocks[0];
+        assert_eq!(
+            b.params.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+    }
+
+    #[test]
+    fn spice_subckt_parameters_are_dependency_ordered() {
+        let nl = parse_netlist(
+            "* t\n.subckt rcblock a b w=1u l=2u\n.param rint=3k\n.param cint=1p\nR1 a b rint\n.ends\n",
+            "ngspice",
+        );
+        let s = &nl.spice_blocks[0].subckts[0];
+        // Independent parameters keep source order (header first, then body).
+        assert_eq!(
+            s.params.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            ["w", "l", "rint", "cint"]
         );
     }
 }

@@ -27,7 +27,13 @@ tree once in Rust and hands the data across in one transfer. It is also the
 natural shape of the neutral structural IR downstream tools want.
 
 Parameter/expression values are carried as **verbatim source text**; the consumer
-re-parses them with its own expression engine.
+re-parses them with its own expression engine. Two dialect normalizations are
+applied first, using the parser's own scope knowledge so the consumer needs no
+post-parse scope tracking: the ambient-temperature builtin is canonicalized to
+`$temp` (Spectre free `temp`, SPICE free `temper`), and each definition's
+parameter list is emitted in dependency order (a true cycle is reported through
+`errors`). The FFI struct shapes are unchanged — the order inside each `Vec` and
+the rewritten text are the only signals.
 
 ## FFI boundary
 
