@@ -23,8 +23,12 @@
 //!   reported through the `errors` field. SPICE lists are left in source order
 //!   (a true cycle is still reported); see the crate README for why.
 //!
-//! The FFI struct shapes are unchanged: order inside the existing `Vec`s and
-//! the rewritten text are the only signals.
+//! The projected POD struct shapes are unchanged: order inside the existing
+//! `Vec`s and the rewritten text are the only signals. The one exception is the
+//! optional include **graph** passed to `parse_netlist_with_includes` /
+//! `parse_netlist_lib_with_includes` (`IncludeGraph.root_gated`,
+//! `IncludeEdge.nested`): it scopes the builtin shadowing and is not part of the
+//! default `parse_netlist` surface.
 
 use netlist_syntax::ast::{self, AstNode};
 use netlist_syntax::spectre_ast as sast;
@@ -261,6 +265,14 @@ mod ffi {
         /// True when the `include` statement sits inside a conditional clause
         /// body in that file, so the declarations it brings are clause-gated.
         gated: bool,
+        /// True when the `include` statement sits inside a nested definition
+        /// (a subcircuit body) in that file. Its declarations belong only to
+        /// that subcircuit's scope: they are *not* visible in the file's own
+        /// scope, nor in a sibling definition's. The closure walker must not
+        /// follow such an edge when computing what the file's own include
+        /// closure makes visible in the file's scope. `false` for a
+        /// file-level `include`.
+        nested: bool,
     }
 
     /// One file in the consumer-supplied include graph.
@@ -292,6 +304,14 @@ mod ffi {
         /// Key of the file `src` projects (matched against a node's `key`).
         /// Empty disables the graph entirely.
         root: String,
+        /// True when `src` is itself projected as a **clause body**: its own
+        /// definition-level declarations are clause-gated, exactly as if they
+        /// sat inside a clause of the file that includes it. Set when the
+        /// projected file is included from inside a conditional clause; a
+        /// clause-gated `temp` declaration is then canonicalized to `$temp`
+        /// and its definition-level parameter list is left in source order
+        /// (never dependency sorted). `false` for a top-level file.
+        root_gated: bool,
         /// Parameter names already visible where `src` is merged: the including
         /// file's own parameters and the declarations of the `include`
         /// statements that share `src`'s scope. An *included* file carries no
@@ -315,7 +335,11 @@ mod ffi {
         /// its own `include` statements, resolves each against the graph, and
         /// applies that file's declarations — clause-gated when the `include`
         /// itself sits inside a clause — to the enclosing scope, following
-        /// nested includes through the graph. The graph's `inherited` list holds
+        /// nested includes through the graph. An `include` inside a subcircuit
+        /// body (`IncludeEdge.nested`) contributes to that subcircuit's scope
+        /// only, never to the file's own. When `IncludeGraph.root_gated` is set,
+        /// `src` is projected as a clause body (its own definition-level
+        /// declarations are clause-gated). The graph's `inherited` list holds
         /// the names visible where the projected file is merged (how a reference
         /// in an *included* file sees a sibling include's declaration). Matching
         /// is case-sensitive for Spectre and case-folded for SPICE. An empty
@@ -1758,6 +1782,10 @@ struct GraphEdge {
     /// The statement sits inside a conditional clause body, so the declarations
     /// it brings into the scope are clause-gated.
     gated: bool,
+    /// The statement sits inside a nested definition (a subcircuit body), so
+    /// its declarations belong to that subcircuit's scope only and must not be
+    /// followed when computing what the file's own closure makes visible.
+    nested: bool,
 }
 
 /// One resolved file in the graph.
@@ -1771,6 +1799,9 @@ struct GraphNode {
 struct IncludeGraph {
     /// Key of the file being projected; empty disables the graph.
     root: String,
+    /// The projected file is itself a clause body: its own definition-level
+    /// declarations are clause-gated.
+    root_gated: bool,
     /// Names visible where the projected file is merged, dialect-normalized.
     inherited: Vec<String>,
     nodes: HashMap<String, GraphNode>,
@@ -1781,6 +1812,7 @@ impl IncludeGraph {
     fn empty() -> ffi::IncludeGraph {
         ffi::IncludeGraph {
             root: String::new(),
+            root_gated: false,
             inherited: vec![],
             nodes: vec![],
         }
@@ -1809,6 +1841,7 @@ impl IncludeGraph {
                         section: e.section.clone(),
                         target: e.target.clone(),
                         gated: e.gated,
+                        nested: e.nested,
                     })
                     .collect(),
             };
@@ -1816,6 +1849,7 @@ impl IncludeGraph {
         }
         IncludeGraph {
             root: graph.root,
+            root_gated: graph.root_gated,
             inherited: graph
                 .inherited
                 .iter()
@@ -1840,9 +1874,12 @@ impl IncludeGraph {
     /// Add every name that the include of `target` makes *unconditionally*
     /// visible to an including scope: `target`'s own definition-level names
     /// plus, recursively, the names its definition-level (`gated == false`)
-    /// includes make visible. Clause-gated edges contribute nothing here — their
-    /// declarations never shadow the temperature builtin. `visited` breaks
-    /// include cycles.
+    /// *file-level* (`nested == false`) includes make visible. Clause-gated
+    /// edges contribute nothing here — their declarations never shadow the
+    /// temperature builtin — and neither do nested-definition (subcircuit-local)
+    /// edges, whose declarations belong to that subcircuit's scope only and must
+    /// not leak into the file's scope or a sibling definition's. `visited`
+    /// breaks include cycles.
     fn add_unconditional_closure(
         &self,
         target: &str,
@@ -1859,7 +1896,7 @@ impl IncludeGraph {
             out.insert(name.clone());
         }
         for edge in &node.includes {
-            if !edge.gated {
+            if !edge.gated && !edge.nested {
                 self.add_unconditional_closure(&edge.target, visited, out);
             }
         }
@@ -1932,7 +1969,12 @@ pub fn parse_netlist(src: &str, language: &str) -> ffi::Netlist {
 /// then walks its OWN `include` statements and applies each included file's
 /// declarations in the scope where that statement sits — clause-gated when the
 /// statement itself sits inside a clause — following nested includes through the
-/// graph. `graph.inherited` carries the names visible where `src` is merged, so
+/// graph. An edge whose `include` sits inside a subcircuit body
+/// (`IncludeEdge.nested`) contributes to that subcircuit's scope only, never to
+/// the file's own scope. When `IncludeGraph.root_gated` is set, `src` is
+/// projected as if it were itself a clause body: its own definition-level
+/// declarations are clause-gated (a `temp` declaration is canonicalized to
+/// `$temp`). `graph.inherited` carries the names visible where `src` is merged, so
 /// a reference in an *included* file sees a sibling include's declaration. An
 /// empty graph is exactly `parse_netlist`.
 pub fn parse_netlist_with_includes(
@@ -1953,13 +1995,19 @@ pub fn parse_netlist_with_includes(
     let mut errors = collect_errors(&root);
     let incompletes = collect_incompletes(&root);
     let source = sast::SpectreNetlistSource::cast(root).expect("root is SpectreNetlistSource");
+    // A root-gated file is included from inside a conditional clause, so it is
+    // projected as a clause body: `clause_gated = true` canonicalizes its own
+    // definition-level `temp` to `$temp` and `order = false` keeps its
+    // definition-level parameter list in source order (never dependency sorted,
+    // never a cycle — clause bodies are the consumer's to resolve).
+    let clause_gated = graph.root_gated;
     let scope = collect_scope(
         source.statements(),
         &inherited,
         &graph,
         &mut errors,
-        true,
-        false,
+        !clause_gated,
+        clause_gated,
     );
     netlist_from_scope(scope, errors, incompletes)
 }
@@ -2083,13 +2131,16 @@ fn parse_spectre_lib(src: &str, section: &str, graph: &IncludeGraph) -> ffi::Net
     }
 
     let inherited: HashSet<String> = graph.inherited.iter().cloned().collect();
+    // A root-gated section is included from inside a conditional clause: project
+    // its statements as a clause body (see `parse_netlist_with_includes`).
+    let clause_gated = graph.root_gated;
     let scope = collect_scope(
         selected.into_iter(),
         &inherited,
         graph,
         &mut errors,
-        true,
-        false,
+        !clause_gated,
+        clause_gated,
     );
     netlist_from_scope(scope, errors, incompletes)
 }
@@ -2122,28 +2173,45 @@ mod tests {
         }
     }
 
-    /// Attach this file's own `include` statements to a node.
+    /// Attach this file's own `include` statements to a node. Each edge is
+    /// `(path, section, target, gated, nested)`.
     fn with_includes(
         mut n: ffi::IncludeNode,
-        edges: &[(&str, &str, &str, bool)],
+        edges: &[(&str, &str, &str, bool, bool)],
     ) -> ffi::IncludeNode {
         n.includes = edges
             .iter()
-            .map(|(path, section, target, gated)| ffi::IncludeEdge {
+            .map(|(path, section, target, gated, nested)| ffi::IncludeEdge {
                 path: path.to_string(),
                 section: section.to_string(),
                 target: target.to_string(),
                 gated: *gated,
+                nested: *nested,
             })
             .collect();
         n
     }
 
+    /// A graph for a top-level file (not itself a clause body).
     fn graph(root: &str, inherited: &[&str], nodes: Vec<ffi::IncludeNode>) -> ffi::IncludeGraph {
         ffi::IncludeGraph {
             root: root.to_string(),
+            root_gated: false,
             inherited: inherited.iter().map(|s| s.to_string()).collect(),
             nodes,
+        }
+    }
+
+    /// A graph for a file that is included from inside a conditional clause, so
+    /// its own definition-level declarations are clause-gated.
+    fn root_gated_graph(
+        root: &str,
+        inherited: &[&str],
+        nodes: Vec<ffi::IncludeNode>,
+    ) -> ffi::IncludeGraph {
+        ffi::IncludeGraph {
+            root_gated: true,
+            ..graph(root, inherited, nodes)
         }
     }
 
@@ -3272,10 +3340,16 @@ ends second_shared_temp
                     node("scope.scs", &[]),
                     &[
                         // `included_cond_temp`'s clause-level include.
-                        ("spectre_temp_cond_decl.scs", "", "cond_decl", true),
-                        ("spectre_temp_later_ref.scs", "", "later_ref", false),
-                        ("spectre_temp_later_decl.scs", "", "later_decl", false),
-                        ("spectre_temp_decl.scs", "", "shared_decl", false),
+                        ("spectre_temp_cond_decl.scs", "", "cond_decl", true, false),
+                        ("spectre_temp_later_ref.scs", "", "later_ref", false, false),
+                        (
+                            "spectre_temp_later_decl.scs",
+                            "",
+                            "later_decl",
+                            false,
+                            false,
+                        ),
+                        ("spectre_temp_decl.scs", "", "shared_decl", false, false),
                     ],
                 ),
                 // cond_decl file: `if (sel==1) { parameters temp=50 }`.
@@ -3397,7 +3471,10 @@ ends without_include
             "f.scs",
             &[],
             vec![
-                with_includes(node("f.scs", &[]), &[("decl.scs", "", "decl", false)]),
+                with_includes(
+                    node("f.scs", &[]),
+                    &[("decl.scs", "", "decl", false, false)],
+                ),
                 node("decl", &["temp"]),
             ],
         );
@@ -3430,14 +3507,151 @@ parameters rval=temp*10
             "f.scs",
             &[],
             vec![
-                with_includes(node("f.scs", &[]), &[("mid.scs", "", "mid", false)]),
-                with_includes(node("mid", &[]), &[("leaf.scs", "", "leaf", false)]),
+                with_includes(node("f.scs", &[]), &[("mid.scs", "", "mid", false, false)]),
+                with_includes(node("mid", &[]), &[("leaf.scs", "", "leaf", false, false)]),
                 node("leaf", &["temp"]),
             ],
         );
         let nl = parse_netlist_with_includes(src, "spectre", g);
         assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
         assert_eq!(val(&nl.params, "rval"), "temp*10");
+    }
+
+    #[test]
+    fn spectre_root_gated_include_canonicalizes_the_included_files_declarations() {
+        // Defect 1: `gated.scs` includes `temp.scs` from INSIDE an `if` clause.
+        // `temp.scs`'s own top-level `parameters temp=50` is therefore
+        // clause-gated in that namespace and must be projected as `$temp` (as
+        // must any `temp` reference), so an active clause binds `$temp` and an
+        // inactive one falls back to the ambient temperature — `rval` is 500,
+        // not the 270 a bare `temp=50` would give.
+        let gated = "\
+simulator lang=spectre
+if (sel==1) {
+  include \"temp.scs\"
+  parameters rval=temp*10
+}
+";
+        let g = graph(
+            "gated.scs",
+            &[],
+            vec![
+                with_includes(
+                    node("gated.scs", &[]),
+                    &[("temp.scs", "", "temp", true, false)],
+                ),
+                node("temp", &["temp"]),
+            ],
+        );
+        let nl = parse_netlist_with_includes(gated, "spectre", g);
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        let body = &nl.conditionals[0].clauses[0].body;
+        // The enclosing clause's reference is the ambient builtin.
+        assert_eq!(val(&body.params, "rval"), "$temp*10");
+        assert!(
+            body.params.iter().all(|p| p.name != "temp"),
+            "the included declaration must not surface as a bare `temp`"
+        );
+
+        // Projecting the included file itself with `root_gated = true`: its ROOT
+        // declarations are a clause body's, so `parameters temp=50` is emitted
+        // as `$temp=50` — the value the active clause binds.
+        let temp = "parameters temp=50\n";
+        let nl = parse_netlist_with_includes(
+            temp,
+            "spectre",
+            root_gated_graph("temp", &[], vec![node("temp", &["temp"])]),
+        );
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        assert_eq!(nl.params.len(), 1);
+        assert_eq!(nl.params[0].name, "$temp");
+        assert_eq!(nl.params[0].value, "50");
+    }
+
+    #[test]
+    fn spectre_root_gated_include_target_with_its_own_clause_still_works() {
+        // The gated include's target already declares its `temp` inside its own
+        // clause. Projecting it root-gated keeps that clause-gated (emitted as
+        // `$temp`) exactly as before — the new flag must not disturb it.
+        let temp = "\
+if (sel2) {
+  parameters temp=50
+}
+";
+        let nl = parse_netlist_with_includes(
+            temp,
+            "spectre",
+            root_gated_graph("temp", &[], vec![node_gated("temp", &["temp"])]),
+        );
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        let clause = &nl.conditionals[0].clauses[0].body;
+        assert_eq!(clause.params[0].name, "$temp");
+        assert_eq!(clause.params[0].value, "50");
+    }
+
+    #[test]
+    fn spectre_nested_subckt_include_does_not_leak_into_the_file_scope() {
+        // Defect 2: `wrapper.scs` includes `temp.scs` from INSIDE a subcircuit.
+        // The consumer marks that edge `nested`, so the declaration belongs to
+        // that subcircuit's scope only and must not make `temp` visible in the
+        // file's own scope. `scope.scs`'s sibling `empty` subcircuit therefore
+        // falls back to the ambient `$temp` — the deck stays loadable instead of
+        // failing with `Variable 'temp' not defined`.
+        let scope = "\
+simulator lang=spectre
+include \"wrapper.scs\"
+subckt empty a b
+  parameters rval=temp*10
+ends empty
+";
+        let g = graph(
+            "scope.scs",
+            &[],
+            vec![
+                with_includes(
+                    node("scope.scs", &[]),
+                    &[("wrapper.scs", "", "wrapper", false, false)],
+                ),
+                with_includes(
+                    node("wrapper", &[]),
+                    &[("temp.scs", "", "temp", false, true)],
+                ),
+                node("temp", &["temp"]),
+            ],
+        );
+        let nl = parse_netlist_with_includes(scope, "spectre", g);
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        let empty = nl.subckts.iter().find(|s| s.name == "empty").unwrap();
+        assert_eq!(val(&empty.params, "rval"), "$temp*10");
+    }
+
+    #[test]
+    fn spectre_nested_subckt_include_declares_temp_for_its_own_subcircuit() {
+        // The nested edge still applies where its `include` sits: inside
+        // `holder`'s scope the included `temp` declaration IS visible and
+        // shadows the builtin, so the reference keeps the declared binding.
+        let wrapper = "\
+simulator lang=spectre
+subckt holder a b
+  include \"temp.scs\"
+  parameters rval=temp*10
+ends holder
+";
+        let g = graph(
+            "wrapper.scs",
+            &[],
+            vec![
+                with_includes(
+                    node("wrapper.scs", &[]),
+                    &[("temp.scs", "", "temp", false, true)],
+                ),
+                node("temp", &["temp"]),
+            ],
+        );
+        let nl = parse_netlist_with_includes(wrapper, "spectre", g);
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        let holder = nl.subckts.iter().find(|s| s.name == "holder").unwrap();
+        assert_eq!(val(&holder.params, "rval"), "temp*10");
     }
 
     #[test]

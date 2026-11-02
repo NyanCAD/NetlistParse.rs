@@ -70,13 +70,23 @@ statements and applies each included file's declarations in the scope where that
 statement sits: a definition-level include makes the file's unconditional names
 visible in the enclosing scope, following nested definition-level includes
 through the graph, while an include inside a conditional clause contributes only
-clause-gated names. A reference in an *included* file — which carries no
-`include` statement for its own includer — sees the merging scope's names through
-the graph's `inherited` list. A free `temp`/`temper` that matches a
-definition-level name is left unrewritten. Names follow the same case rule as
-every other declaration — case-sensitive for Spectre, case-folded for SPICE. The
-original `parse_netlist` / `parse_netlist_lib` entry points remain and default
-the graph to empty, so single-file callers are unaffected.
+clause-gated names. Each edge carries two flags that scope it: `gated` (the
+`include` sits inside a conditional clause) and `nested` (the `include` sits
+inside a subcircuit body). A `nested` edge contributes its declarations to that
+subcircuit's scope only — never to the file's own scope nor to a sibling
+definition's — and the closure walker does not follow it when computing what a
+file's own includes make visible in that file's scope. A reference in an
+*included* file — which carries no `include` statement for its own includer —
+sees the merging scope's names through the graph's `inherited` list. When the
+projected file is *itself* included from inside a conditional clause, its own
+definition-level declarations are clause-gated: the consumer sets
+`IncludeGraph.root_gated`, and the parser then projects the file as a clause body
+(a top-level `temp` declaration becomes `$temp`, and its parameter list stays in
+source order). A free `temp`/`temper` that matches a definition-level name is
+left unrewritten. Names follow the same case rule as every other declaration —
+case-sensitive for Spectre, case-folded for SPICE. The original `parse_netlist` /
+`parse_netlist_lib` entry points remain and default the graph to empty
+(`root_gated = false`, no edges), so single-file callers are unaffected.
 
 ## Known limitations of the builtin normalization
 
@@ -84,7 +94,7 @@ The projection covers the temperature-scope shapes the consumer needs — a free
 `temp`/`temper` shadowed by a declaration in the same definition, by an
 unconditional declaration visible through an include in that scope, or (bound by
 the *active* clause of) a clause-gated declaration — with no consumer-side scope
-re-derivation and no `temp=$temp` style alias injection. In particular, the two
+re-derivation and no `temp=$temp` style alias injection. In particular, the
 corners the earlier flat inherited-name list could not express are now closed:
 
 1. **Per-subcircuit namespaces.** The include graph is applied in the scope where
@@ -96,6 +106,17 @@ corners the earlier flat inherited-name list could not express are now closed:
    suppressing the rewrite, so a reference in an inactive clause falls back to
    the ambient `$temp` and an active clause's `$temp` shadows it. No consumer
    alias is needed.
+3. **Gated include target.** A file included from inside a conditional clause is
+   projected with `IncludeGraph.root_gated`, so its OWN top-level declarations
+   are clause-gated too: they are emitted as `$temp` rather than as a bare
+   `temp`, and the enclosing clause's `$temp` binding shadows the ambient option
+   (the value the earlier projection silently doubled as a declared `temp`).
+4. **Subcircuit-local include closure.** A subcircuit-local `include` is marked
+   `IncludeEdge.nested`, so its declarations stay in that subcircuit's scope and
+   are not followed when a file's own include closure is computed. A sibling
+   definition no longer inherits them (the deck stays loadable instead of
+   failing with `Variable 'temp' not defined`), while the subcircuit that
+   actually includes the declaration still sees it.
 
 Two things remain out of scope, and a consumer that reaches them must still
 resolve the name itself:
