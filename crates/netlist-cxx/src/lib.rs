@@ -251,34 +251,86 @@ mod ffi {
         spice_blocks: Vec<SpiceBlock>,
     }
 
+    /// One `include` statement of a file in the consumer-supplied include
+    /// graph: the literal `path`/`section` written in that statement and the
+    /// `target` node key it resolves to.
+    struct IncludeEdge {
+        path: String,
+        section: String,
+        target: String,
+        /// True when the `include` statement sits inside a conditional clause
+        /// body in that file, so the declarations it brings are clause-gated.
+        gated: bool,
+    }
+
+    /// One file in the consumer-supplied include graph.
+    struct IncludeNode {
+        /// Opaque key identifying this file (consumer-chosen; e.g. its resolved
+        /// path, or path plus selected section). Matched against
+        /// `IncludeGraph.root` and `IncludeEdge.target`.
+        key: String,
+        /// Parameter names this file declares at definition level (outside any
+        /// conditional clause). Visible to a file that includes it at
+        /// definition level, where a declared `temp`/`temper` shadows the
+        /// ambient-temperature builtin.
+        unconditional: Vec<String>,
+        /// Parameter names this file declares inside a conditional clause. When
+        /// this file is included, they are clause-gated in the includer's scope,
+        /// so (per the builtin rule) a clause-gated `temp`/`temper` never
+        /// shadows the ambient-temperature builtin.
+        conditional: Vec<String>,
+        /// This file's own `include` statements, in source order.
+        includes: Vec<IncludeEdge>,
+    }
+
+    /// The consumer-resolved include graph, plus the scope the projected file
+    /// is merged into. The parser reads no files: the consumer resolves the
+    /// include closure, records each file's declared names and its own nested
+    /// includes, and hands the graph here. A default (empty) graph reproduces
+    /// `parse_netlist` exactly.
+    struct IncludeGraph {
+        /// Key of the file `src` projects (matched against a node's `key`).
+        /// Empty disables the graph entirely.
+        root: String,
+        /// Parameter names already visible where `src` is merged: the including
+        /// file's own parameters and the declarations of the `include`
+        /// statements that share `src`'s scope. An *included* file carries no
+        /// `include` statement for its own includer, so the parser cannot derive
+        /// these from `src` alone; the consumer passes them. Clause-gated
+        /// declarations must not appear here (they never shadow the builtin).
+        /// Empty for a top-level file.
+        inherited: Vec<String>,
+        /// One node per file the consumer wants the parser to know about.
+        nodes: Vec<IncludeNode>,
+    }
+
     extern "Rust" {
         /// Parse foreign netlist source into a flat `Netlist`. `language` is one
         /// of ngspice|hspice|pspice|xyce|spectre (case-insensitive). SPICE
         /// dialects use the SPICE parser; `spectre` uses the Spectre parser.
         fn parse_netlist(src: &str, language: &str) -> Netlist;
-        /// Like `parse_netlist`, but with `inherited_names` — the parameter
-        /// names declared in the enclosing file(s) and their include chain —
-        /// visible to the temperature-builtin shadowing. The parser reads no
-        /// files: the consumer resolves includes, collects the names they
-        /// declare, and passes them here. Matching is case-sensitive for
-        /// Spectre and case-folded for SPICE. An empty slice reproduces
-        /// `parse_netlist` exactly.
-        fn parse_netlist_with_inherited_names(
-            src: &str,
-            language: &str,
-            inherited_names: &[String],
-        ) -> Netlist;
+        /// Like `parse_netlist`, but with a consumer-resolved `graph` of the
+        /// include closure, visible to the projection's temperature-builtin
+        /// shadowing *in the scope where each `include` sits*: the parser walks
+        /// its own `include` statements, resolves each against the graph, and
+        /// applies that file's declarations — clause-gated when the `include`
+        /// itself sits inside a clause — to the enclosing scope, following
+        /// nested includes through the graph. The graph's `inherited` list holds
+        /// the names visible where the projected file is merged (how a reference
+        /// in an *included* file sees a sibling include's declaration). Matching
+        /// is case-sensitive for Spectre and case-folded for SPICE. An empty
+        /// graph reproduces `parse_netlist` exactly.
+        fn parse_netlist_with_includes(src: &str, language: &str, graph: IncludeGraph) -> Netlist;
         /// Parse a SPICE `.lib` file (dialect per `language`) and project only
         /// the named section. `language=spectre` is unsupported (errors).
         fn parse_netlist_lib(src: &str, section: &str, language: &str) -> Netlist;
-        /// Like `parse_netlist_lib`, with `inherited_names` visible to the
-        /// temperature-builtin shadowing (see
-        /// `parse_netlist_with_inherited_names`).
-        fn parse_netlist_lib_with_inherited_names(
+        /// Like `parse_netlist_lib`, with an include `graph` visible to the
+        /// temperature-builtin shadowing (see `parse_netlist_with_includes`).
+        fn parse_netlist_lib_with_includes(
             src: &str,
             section: &str,
             language: &str,
-            inherited_names: &[String],
+            graph: IncludeGraph,
         ) -> Netlist;
     }
 }
@@ -668,6 +720,29 @@ fn project_param(p: &sast::Parameter, scope: &HashSet<String>) -> ffi::Param {
     }
 }
 
+/// Project a **clause-gated** Spectre `parameters` entry.
+///
+/// A `temp` declared inside a conditional clause is gated by that clause, so it
+/// must not hide the builtin from the rewrite (see `collect_scope`). Instead the
+/// declared NAME is emitted as the consumer's builtin spelling `$temp`, and the
+/// value goes through the same rewrite as every other expression, so a free
+/// `temp` in the clause namespace becomes `$temp` exactly as if there were no
+/// declaration. The active clause's `$temp` then shadows the ambient option;
+/// an inactive clause leaves the ambient option visible. This is Spectre-only
+/// (`temper`, and SPICE clause handling, are unchanged).
+fn project_param_clause_gated(p: &sast::Parameter, scope: &HashSet<String>) -> ffi::Param {
+    let name = tok_text(p.name());
+    let name = if name == "temp" {
+        "$temp".to_string()
+    } else {
+        name
+    };
+    ffi::Param {
+        name,
+        value: rewrite_temp(&p.value_text().unwrap_or_default(), false, scope),
+    }
+}
+
 fn project_instance(i: &sast::Instance, scope: &HashSet<String>) -> ffi::Instance {
     ffi::Instance {
         name: tok_text(i.name()),
@@ -713,11 +788,14 @@ fn project_function(f: &sast::FunctionDecl, scope: &HashSet<String>) -> ffi::Fun
 fn project_block(
     stmts: impl Iterator<Item = SyntaxNode>,
     inherited: &HashSet<String>,
+    graph: &IncludeGraph,
     errors: &mut Vec<ffi::ParseError>,
 ) -> ffi::Block {
     // A conditional clause body: `order = false`, so clause-gated parameters
-    // are never sorted and can never report a cycle (see `collect_scope`).
-    let scope = collect_scope(stmts, inherited, errors, false);
+    // are never sorted and can never report a cycle (see `collect_scope`);
+    // `clause_gated = true`, so nothing declared here (locally or by a
+    // clause-level include) shadows the temperature builtin.
+    let scope = collect_scope(stmts, inherited, graph, errors, false, true);
     ffi::Block {
         params: scope.params,
         models: scope.models,
@@ -731,25 +809,26 @@ fn project_block(
 fn project_conditional(
     c: &sast::ConditionalBlock,
     scope: &HashSet<String>,
+    graph: &IncludeGraph,
     errors: &mut Vec<ffi::ParseError>,
 ) -> ffi::Conditional {
     let mut clauses = Vec::new();
     if let Some(iff) = c.if_clause() {
         clauses.push(ffi::CondClause {
             condition: rewrite_temp(&iff.condition().unwrap_or_default(), false, scope),
-            body: project_block(iff.body(), scope, errors),
+            body: project_block(iff.body(), scope, graph, errors),
         });
     }
     for ei in c.else_ifs() {
         clauses.push(ffi::CondClause {
             condition: rewrite_temp(&ei.condition().unwrap_or_default(), false, scope),
-            body: project_block(ei.body(), scope, errors),
+            body: project_block(ei.body(), scope, graph, errors),
         });
     }
     if let Some(els) = c.else_clause() {
         clauses.push(ffi::CondClause {
             condition: String::new(),
-            body: project_block(els.body(), scope, errors),
+            body: project_block(els.body(), scope, graph, errors),
         });
     }
     ffi::Conditional { clauses }
@@ -758,9 +837,10 @@ fn project_conditional(
 fn project_subckt(
     s: &sast::Subckt,
     inherited: &HashSet<String>,
+    graph: &IncludeGraph,
     errors: &mut Vec<ffi::ParseError>,
 ) -> ffi::Subckt {
-    let scope = collect_scope(s.body(), inherited, errors, true);
+    let scope = collect_scope(s.body(), inherited, graph, errors, true, false);
     ffi::Subckt {
         name: tok_text(s.name()),
         is_inline: s.is_inline(),
@@ -1419,43 +1499,22 @@ struct Scope {
     functions: Vec<ffi::FunctionDef>,
 }
 
-/// Collect parameter names declared inside conditional clause bodies straight
-/// from the syntax tree (before projection), so the enclosing definition's
-/// rewrite scope already contains them.
-fn collect_conditional_names_from_ast(stmts: &[SyntaxNode], out: &mut HashSet<String>) {
-    for stmt in stmts {
-        if let Some(c) = sast::ConditionalBlock::cast(stmt.clone()) {
-            for body in conditional_clause_bodies(&c) {
-                for s in &body {
-                    if s.kind() == SyntaxKind::Parameters {
-                        if let Some(p) = sast::Parameters::cast(s.clone()) {
-                            for prm in p.params() {
-                                if let Some(t) = prm.name() {
-                                    out.insert(t.text().to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-                collect_conditional_names_from_ast(&body, out);
-            }
-        }
+/// Resolve a definition-level Spectre `include` statement against the graph,
+/// returning the included file's node key when the graph knows it. The parser
+/// matches the statement's literal `path`/`section` against the root node's
+/// edges (the same spelling the consumer recorded), never re-resolving a path.
+fn graph_root_include_target<'a>(stmt: &SyntaxNode, graph: &'a IncludeGraph) -> Option<&'a str> {
+    if stmt.kind() != SyntaxKind::Include {
+        return None;
     }
-}
-
-/// The statement bodies of every clause of a conditional block, in source order.
-fn conditional_clause_bodies(c: &sast::ConditionalBlock) -> Vec<Vec<SyntaxNode>> {
-    let mut bodies = Vec::new();
-    if let Some(iff) = c.if_clause() {
-        bodies.push(iff.body().collect());
-    }
-    for ei in c.else_ifs() {
-        bodies.push(ei.body().collect());
-    }
-    if let Some(els) = c.else_clause() {
-        bodies.push(els.body().collect());
-    }
-    bodies
+    let inc = sast::Include::cast(stmt.clone())?;
+    let path = unquote(&tok_text(inc.path()));
+    let section = inc
+        .section()
+        .and_then(|s| s.id())
+        .map(|t| t.text().to_string())
+        .unwrap_or_default();
+    graph.resolve_root_include(&path, &section)
 }
 
 /// Collect one Spectre scope's statements into a `Scope`.
@@ -1472,30 +1531,60 @@ fn conditional_clause_bodies(c: &sast::ConditionalBlock) -> Vec<Vec<SyntaxNode>>
 /// cannot say "not really an error". Reporting one here would make a perfectly
 /// loadable deck unloadable. Clause-body parameters therefore stay in source
 /// order, untouched by `order_params`.
+///
+/// CLAUSE-GATED `temp` IS CANONICALIZED, NOT SHADOWED. `clause_gated` marks a
+/// conditional clause body. Such a declaration is gated by its clause, so it
+/// cannot hide the ambient-temperature builtin from the rewrite: only
+/// definition-level declarations (a this-scope `parameters`, an inherited name,
+/// or a definition-level include's declaration) do. Everything declared inside a
+/// clause — locally or by a clause-level include — is therefore kept out of the
+/// shadowing set, and a clause-gated `temp` declaration is emitted as `$temp`
+/// with its references rewritten to `$temp` exactly as if it were undeclared.
+/// At run time the active clause's `$temp` shadows the ambient option and an
+/// inactive clause leaves the ambient option visible — the fallback the
+/// flat inherited set could not express. (Spectre-only: SPICE `temper`
+/// handling is unchanged.)
+///
+/// `graph` carries the consumer-resolved include closure. A definition-level
+/// `include` statement contributes the included file's *unconditional* names to
+/// this scope (following nested definition-level includes through the graph); a
+/// clause-level `include` contributes nothing to the shadowing set, because its
+/// declarations are clause-gated too. The parser walks its own `include`
+/// statements, so a subcircuit that includes nothing never sees a sibling's
+/// include declarations.
 fn collect_scope(
     stmts: impl Iterator<Item = SyntaxNode>,
     inherited: &HashSet<String>,
+    graph: &IncludeGraph,
     errors: &mut Vec<ffi::ParseError>,
     order: bool,
+    clause_gated: bool,
 ) -> Scope {
     let stmts: Vec<SyntaxNode> = stmts.collect();
 
-    // Visible parameter names: this definition's `parameters` plus any declared
-    // inside its conditional clauses. A parameter of that name shadows the
-    // `temp` builtin for every expression in this definition.
+    // Visible parameter names. A definition-level `parameters` and a
+    // definition-level include's unconditional names shadow the builtin for
+    // every expression in this scope; clause-gated declarations never do.
     let mut scope_names = inherited.clone();
-    for stmt in &stmts {
-        if stmt.kind() == SyntaxKind::Parameters {
-            if let Some(p) = sast::Parameters::cast(stmt.clone()) {
-                for prm in p.params() {
-                    if let Some(t) = prm.name() {
-                        scope_names.insert(t.text().to_string());
+    if !clause_gated {
+        for stmt in &stmts {
+            if stmt.kind() == SyntaxKind::Parameters {
+                if let Some(p) = sast::Parameters::cast(stmt.clone()) {
+                    for prm in p.params() {
+                        if let Some(t) = prm.name() {
+                            scope_names.insert(t.text().to_string());
+                        }
                     }
                 }
             }
         }
+        for stmt in &stmts {
+            if let Some(target) = graph_root_include_target(stmt, graph) {
+                let mut visited = HashSet::new();
+                graph.add_unconditional_closure(target, &mut visited, &mut scope_names);
+            }
+        }
     }
-    collect_conditional_names_from_ast(&stmts, &mut scope_names);
     let scope = &scope_names;
 
     let mut collected = Scope::default();
@@ -1513,7 +1602,9 @@ fn collect_scope(
             }
             SyntaxKind::Subckt => {
                 if let Some(s) = sast::Subckt::cast(stmt) {
-                    collected.subckts.push(project_subckt(&s, scope, errors));
+                    collected
+                        .subckts
+                        .push(project_subckt(&s, scope, graph, errors));
                 }
             }
             SyntaxKind::FunctionDecl => {
@@ -1523,9 +1614,13 @@ fn collect_scope(
             }
             SyntaxKind::Parameters => {
                 if let Some(p) = sast::Parameters::cast(stmt) {
-                    collected
-                        .params
-                        .extend(p.params().map(|p| project_param(&p, scope)));
+                    collected.params.extend(p.params().map(|p| {
+                        if clause_gated {
+                            project_param_clause_gated(&p, scope)
+                        } else {
+                            project_param(&p, scope)
+                        }
+                    }));
                 }
             }
             // Conditionals are projected with the definition's full scope,
@@ -1534,7 +1629,7 @@ fn collect_scope(
                 if let Some(c) = sast::ConditionalBlock::cast(stmt) {
                     collected
                         .conditionals
-                        .push(project_conditional(&c, scope, errors));
+                        .push(project_conditional(&c, scope, graph, errors));
                 }
             }
             SyntaxKind::Analysis => {
@@ -1643,22 +1738,132 @@ fn resolve_lang(name: &str) -> Option<Lang> {
     }
 }
 
-/// Build the projection's inherited-name set from a caller-supplied list,
-/// applying the dialect's case rule — the same rule `rewrite_temp` uses when it
-/// looks a name up: SPICE identifiers are case-folded (its `temper` match is
-/// case-insensitive), Spectre identifiers are kept verbatim (Spectre is
-/// case-sensitive). Exactly one set is allocated per projection call.
-fn inherited_names_set(names: &[String], spice: bool) -> HashSet<String> {
-    names
-        .iter()
-        .map(|n| {
-            if spice {
-                n.to_ascii_lowercase()
-            } else {
-                n.clone()
+/// Normalize a parameter name to the dialect's lookup key: SPICE identifiers are
+/// case-folded (its `temper` match is case-insensitive), Spectre identifiers are
+/// kept verbatim (Spectre is case-sensitive). This is the same rule
+/// `rewrite_temp` applies when it looks a name up.
+fn dialect_key(name: &str, spice: bool) -> String {
+    if spice {
+        name.to_ascii_lowercase()
+    } else {
+        name.to_string()
+    }
+}
+
+/// One resolved `include` statement of a graph file.
+struct GraphEdge {
+    path: String,
+    section: String,
+    target: String,
+    /// The statement sits inside a conditional clause body, so the declarations
+    /// it brings into the scope are clause-gated.
+    gated: bool,
+}
+
+/// One resolved file in the graph.
+struct GraphNode {
+    /// Definition-level (unconditional) parameter names, dialect-normalized.
+    unconditional: Vec<String>,
+    includes: Vec<GraphEdge>,
+}
+
+/// The consumer-supplied include graph, normalized for the projection.
+struct IncludeGraph {
+    /// Key of the file being projected; empty disables the graph.
+    root: String,
+    /// Names visible where the projected file is merged, dialect-normalized.
+    inherited: Vec<String>,
+    nodes: HashMap<String, GraphNode>,
+}
+
+impl IncludeGraph {
+    /// The plain projection: no graph, no inherited names.
+    fn empty() -> ffi::IncludeGraph {
+        ffi::IncludeGraph {
+            root: String::new(),
+            inherited: vec![],
+            nodes: vec![],
+        }
+    }
+
+    /// Normalize a caller-supplied `ffi::IncludeGraph` for the dialect.
+    fn from_ffi(graph: ffi::IncludeGraph, spice: bool) -> IncludeGraph {
+        let mut nodes = HashMap::with_capacity(graph.nodes.len());
+        for node in graph.nodes {
+            // `node.conditional` is deliberately not retained: a clause-gated
+            // declaration never shadows the temperature builtin, so only the
+            // unconditional set feeds the projection. The field stays in the
+            // bridge so the consumer states the distinction explicitly.
+            let _conditional = node.conditional;
+            let entry = GraphNode {
+                unconditional: node
+                    .unconditional
+                    .iter()
+                    .map(|n| dialect_key(n, spice))
+                    .collect(),
+                includes: node
+                    .includes
+                    .iter()
+                    .map(|e| GraphEdge {
+                        path: e.path.clone(),
+                        section: e.section.clone(),
+                        target: e.target.clone(),
+                        gated: e.gated,
+                    })
+                    .collect(),
+            };
+            nodes.insert(node.key, entry);
+        }
+        IncludeGraph {
+            root: graph.root,
+            inherited: graph
+                .inherited
+                .iter()
+                .map(|n| dialect_key(n, spice))
+                .collect(),
+            nodes,
+        }
+    }
+
+    /// Resolve an `include` statement written as (`path`, `section`) inside the
+    /// root file to its target node key. The root file's own statements are
+    /// matched against the root node's `includes`; nested edges are followed by
+    /// key, never by re-matching paths.
+    fn resolve_root_include(&self, path: &str, section: &str) -> Option<&str> {
+        let root = self.nodes.get(&self.root)?;
+        root.includes
+            .iter()
+            .find(|e| e.path == path && e.section == section)
+            .map(|e| e.target.as_str())
+    }
+
+    /// Add every name that the include of `target` makes *unconditionally*
+    /// visible to an including scope: `target`'s own definition-level names
+    /// plus, recursively, the names its definition-level (`gated == false`)
+    /// includes make visible. Clause-gated edges contribute nothing here — their
+    /// declarations never shadow the temperature builtin. `visited` breaks
+    /// include cycles.
+    fn add_unconditional_closure(
+        &self,
+        target: &str,
+        visited: &mut HashSet<String>,
+        out: &mut HashSet<String>,
+    ) {
+        if !visited.insert(target.to_string()) {
+            return;
+        }
+        let Some(node) = self.nodes.get(target) else {
+            return;
+        };
+        for name in &node.unconditional {
+            out.insert(name.clone());
+        }
+        for edge in &node.includes {
+            if !edge.gated {
+                self.add_unconditional_closure(&edge.target, visited, out);
             }
-        })
-        .collect()
+        }
+    }
 }
 
 /// A `Netlist` carrying a single synthetic parse error (byte range 0..0), used
@@ -1717,20 +1922,23 @@ fn netlist_from_scope(
 }
 
 pub fn parse_netlist(src: &str, language: &str) -> ffi::Netlist {
-    parse_netlist_with_inherited_names(src, language, &[])
+    parse_netlist_with_includes(src, language, IncludeGraph::empty())
 }
 
-/// Parse `src` with `inherited_names` — the parameter names declared in the
-/// enclosing file(s) and their include chain — visible to the projection's
-/// temperature-builtin shadowing. This is the additive entry point the consumer
-/// uses to reproduce cross-include shadowing without the parser reading files:
-/// the consumer resolves includes, collects the names they declare, and passes
-/// them here (cheap to call repeatedly — no file I/O, no global state, one set
-/// built per call). An empty slice is exactly `parse_netlist`.
-pub fn parse_netlist_with_inherited_names(
+/// Parse `src` with a consumer-resolved `graph` of the include closure. The
+/// parser reads no files: the consumer resolves includes and hands over, per
+/// file, the names the file declares (separating definition-level from
+/// clause-gated declarations) and the file's own nested includes. The parser
+/// then walks its OWN `include` statements and applies each included file's
+/// declarations in the scope where that statement sits — clause-gated when the
+/// statement itself sits inside a clause — following nested includes through the
+/// graph. `graph.inherited` carries the names visible where `src` is merged, so
+/// a reference in an *included* file sees a sibling include's declaration. An
+/// empty graph is exactly `parse_netlist`.
+pub fn parse_netlist_with_includes(
     src: &str,
     language: &str,
-    inherited_names: &[String],
+    graph: ffi::IncludeGraph,
 ) -> ffi::Netlist {
     let (start_lang, dialect) = match resolve_lang(language) {
         // Spectre start: dialect is only consulted if a `simulator lang=spice`
@@ -1739,12 +1947,20 @@ pub fn parse_netlist_with_inherited_names(
         Some(Lang::Spice(d)) => (StartLang::Spice, d),
         None => return lang_error_netlist(),
     };
-    let inherited = inherited_names_set(inherited_names, matches!(start_lang, StartLang::Spice));
+    let graph = IncludeGraph::from_ffi(graph, matches!(start_lang, StartLang::Spice));
+    let inherited: HashSet<String> = graph.inherited.iter().cloned().collect();
     let root = parse_spectre_with(src, start_lang, dialect);
     let mut errors = collect_errors(&root);
     let incompletes = collect_incompletes(&root);
     let source = sast::SpectreNetlistSource::cast(root).expect("root is SpectreNetlistSource");
-    let scope = collect_scope(source.statements(), &inherited, &mut errors, true);
+    let scope = collect_scope(
+        source.statements(),
+        &inherited,
+        &graph,
+        &mut errors,
+        true,
+        false,
+    );
     netlist_from_scope(scope, errors, incompletes)
 }
 
@@ -1754,26 +1970,26 @@ pub fn parse_netlist_with_inherited_names(
 /// (Spectre has no separate block type), so a consumer merges them into the
 /// current scope exactly as it would a flat Spectre netlist.
 pub fn parse_netlist_lib(src: &str, section: &str, language: &str) -> ffi::Netlist {
-    parse_netlist_lib_with_inherited_names(src, section, language, &[])
+    parse_netlist_lib_with_includes(src, section, language, IncludeGraph::empty())
 }
 
-/// Like `parse_netlist_lib`, with `inherited_names` visible to the projection's
-/// temperature-builtin shadowing (see `parse_netlist_with_inherited_names`).
-pub fn parse_netlist_lib_with_inherited_names(
+/// Like `parse_netlist_lib`, with an include `graph` visible to the
+/// temperature-builtin shadowing (see `parse_netlist_with_includes`).
+pub fn parse_netlist_lib_with_includes(
     src: &str,
     section: &str,
     language: &str,
-    inherited_names: &[String],
+    graph: ffi::IncludeGraph,
 ) -> ffi::Netlist {
     match resolve_lang(language) {
-        Some(Lang::Spice(dialect)) => parse_spice_lib(
-            src,
-            section,
-            dialect,
-            &inherited_names_set(inherited_names, true),
-        ),
+        Some(Lang::Spice(dialect)) => {
+            let graph = IncludeGraph::from_ffi(graph, true);
+            let inherited: HashSet<String> = graph.inherited.into_iter().collect();
+            parse_spice_lib(src, section, dialect, &inherited)
+        }
         Some(Lang::Spectre) => {
-            parse_spectre_lib(src, section, &inherited_names_set(inherited_names, false))
+            let graph = IncludeGraph::from_ffi(graph, false);
+            parse_spectre_lib(src, section, &graph)
         }
         None => lang_error_netlist(),
     }
@@ -1835,7 +2051,7 @@ fn spectre_section_matches(sec: &sast::Section, wanted: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn parse_spectre_lib(src: &str, section: &str, inherited: &HashSet<String>) -> ffi::Netlist {
+fn parse_spectre_lib(src: &str, section: &str, graph: &IncludeGraph) -> ffi::Netlist {
     let root = parse_spectre_with(src, StartLang::Spectre, Dialect::Ngspice);
     let mut errors = collect_errors(&root);
     let incompletes = collect_incompletes(&root);
@@ -1866,16 +2082,70 @@ fn parse_spectre_lib(src: &str, section: &str, inherited: &HashSet<String>) -> f
         }
     }
 
-    let scope = collect_scope(selected.into_iter(), inherited, &mut errors, true);
+    let inherited: HashSet<String> = graph.inherited.iter().cloned().collect();
+    let scope = collect_scope(
+        selected.into_iter(),
+        &inherited,
+        graph,
+        &mut errors,
+        true,
+        false,
+    );
     netlist_from_scope(scope, errors, incompletes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_netlist, parse_netlist_lib, parse_netlist_lib_with_inherited_names,
-        parse_netlist_with_inherited_names,
+        parse_netlist, parse_netlist_lib, parse_netlist_lib_with_includes,
+        parse_netlist_with_includes,
     };
+    use crate::ffi;
+
+    /// A graph node with definition-level (`uncond`) names only.
+    fn node(key: &str, uncond: &[&str]) -> ffi::IncludeNode {
+        ffi::IncludeNode {
+            key: key.to_string(),
+            unconditional: uncond.iter().map(|s| s.to_string()).collect(),
+            conditional: vec![],
+            includes: vec![],
+        }
+    }
+
+    /// A graph node whose declared names are all clause-gated.
+    fn node_gated(key: &str, cond: &[&str]) -> ffi::IncludeNode {
+        ffi::IncludeNode {
+            key: key.to_string(),
+            unconditional: vec![],
+            conditional: cond.iter().map(|s| s.to_string()).collect(),
+            includes: vec![],
+        }
+    }
+
+    /// Attach this file's own `include` statements to a node.
+    fn with_includes(
+        mut n: ffi::IncludeNode,
+        edges: &[(&str, &str, &str, bool)],
+    ) -> ffi::IncludeNode {
+        n.includes = edges
+            .iter()
+            .map(|(path, section, target, gated)| ffi::IncludeEdge {
+                path: path.to_string(),
+                section: section.to_string(),
+                target: target.to_string(),
+                gated: *gated,
+            })
+            .collect();
+        n
+    }
+
+    fn graph(root: &str, inherited: &[&str], nodes: Vec<ffi::IncludeNode>) -> ffi::IncludeGraph {
+        ffi::IncludeGraph {
+            root: root.to_string(),
+            inherited: inherited.iter().map(|s| s.to_string()).collect(),
+            nodes,
+        }
+    }
 
     #[test]
     fn projects_spice_scoped_includes_and_nested_conditionals() {
@@ -2613,10 +2883,12 @@ ends adnfet\n";
     }
 
     #[test]
-    fn spectre_temp_conditional_declaration_shadows() {
-        // A `temp` declared in a conditional clause joins the definition's
-        // translation namespace, so it shadows the builtin for the whole
-        // definition (mirroring the consumer's scope model).
+    fn spectre_temp_conditional_declaration_is_canonicalized_not_shadowed() {
+        // A `temp` declared in a conditional clause is gated by that clause, so
+        // it must NOT hide the builtin from the rewrite: the declared NAME is
+        // emitted as `$temp`, and a free `temp` elsewhere in the definition
+        // becomes `$temp`. The active clause's `$temp` shadows the ambient
+        // option; an inactive clause leaves the ambient option visible.
         let nl = parse_netlist(
             "simulator lang=spectre\n\
              parameters y=temp\n\
@@ -2627,7 +2899,11 @@ ends adnfet\n";
         );
         assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
         let y = nl.params.iter().find(|p| p.name == "y").unwrap();
-        assert_eq!(y.value, "temp", "conditional declaration must shadow");
+        assert_eq!(y.value, "$temp", "clause-gated declaration must not shadow");
+        assert_eq!(
+            nl.conditionals[0].clauses[0].body.params[0].name, "$temp",
+            "the clause-gated declaration is emitted as `$temp`"
+        );
         assert_eq!(nl.conditionals[0].clauses[0].body.params[0].value, "1");
     }
 
@@ -2822,23 +3098,19 @@ ends adnfet\n";
         );
     }
 
-    // --- Inherited (enclosing include-chain) parameter names ---
+    // --- Consumer-supplied include graph (per-scope shadowing) ---
 
     #[test]
     fn spectre_inherited_temp_shadows_builtin() {
-        // Two-file contract: the included file declares `temp`; the enclosing
-        // file's free `temp` must keep that binding, not become the ambient
-        // temperature builtin. With an empty inherited set it is the builtin.
+        // Names already visible where the projected file is merged suppress the
+        // rewrite. With an empty graph the free `temp` is the builtin.
         let enclosing = "simulator lang=spectre\nparameters y=temp+1\n";
         let alone = parse_netlist(enclosing, "spectre");
         let y = alone.params.iter().find(|p| p.name == "y").unwrap();
-        assert_eq!(
-            y.value, "$temp+1",
-            "empty inherited set rewrites to builtin"
-        );
+        assert_eq!(y.value, "$temp+1", "empty graph rewrites to builtin");
 
         let inherited =
-            parse_netlist_with_inherited_names(enclosing, "spectre", &["temp".to_string()]);
+            parse_netlist_with_includes(enclosing, "spectre", graph("f", &["temp"], vec![]));
         let y = inherited.params.iter().find(|p| p.name == "y").unwrap();
         assert_eq!(y.value, "temp+1", "inherited `temp` shadows the builtin");
     }
@@ -2847,10 +3119,10 @@ ends adnfet\n";
     fn spectre_inherited_names_are_case_sensitive() {
         // Spectre identifiers are case-sensitive: an inherited `TEMP` must not
         // shadow the lowercase builtin `temp`.
-        let nl = parse_netlist_with_inherited_names(
+        let nl = parse_netlist_with_includes(
             "simulator lang=spectre\nparameters y=temp\n",
             "spectre",
-            &["TEMP".to_string()],
+            graph("f", &["TEMP"], vec![]),
         );
         assert_eq!(nl.params[0].value, "$temp");
     }
@@ -2859,10 +3131,10 @@ ends adnfet\n";
     fn spectre_inherited_combines_with_local_declaration() {
         // Inherited `temp` plus a locally declared `k` are both preserved in
         // the same expression (the visible scope is their union).
-        let nl = parse_netlist_with_inherited_names(
+        let nl = parse_netlist_with_includes(
             "simulator lang=spectre\nparameters k=2 y=temp+k\n",
             "spectre",
-            &["temp".to_string()],
+            graph("f", &["temp"], vec![]),
         );
         let y = nl.params.iter().find(|p| p.name == "y").unwrap();
         assert_eq!(y.value, "temp+k");
@@ -2870,33 +3142,33 @@ ends adnfet\n";
 
     #[test]
     fn spectre_inherited_combines_with_conditional_declaration() {
-        // A `temp` declared in a conditional clause joins the definition scope;
-        // an unrelated inherited name (`a`) is honoured at the same time.
-        let nl = parse_netlist_with_inherited_names(
+        // A `temp` declared in a conditional clause never shadows; an unrelated
+        // inherited name (`a`) is honoured at the same time, so `temp` becomes
+        // `$temp` while `a` keeps its binding.
+        let nl = parse_netlist_with_includes(
             "simulator lang=spectre\n\
              parameters y=temp+a\n\
              if (1) {\n\
              parameters temp=1\n\
              }\n",
             "spectre",
-            &["a".to_string()],
+            graph("f", &["a"], vec![]),
         );
         assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
         let y = nl.params.iter().find(|p| p.name == "y").unwrap();
-        assert_eq!(y.value, "temp+a");
+        assert_eq!(y.value, "$temp+a");
     }
 
     #[test]
     fn spice_inherited_temper_shadows_builtin_case_folded() {
-        // SPICE equivalent: an include declares `temper`; the enclosing `.param`
-        // keeps the declared binding. The inherited name is case-folded, so its
-        // casing does not matter.
+        // SPICE equivalent: an inherited name suppresses the `temper` rewrite.
+        // The inherited name is case-folded, so its casing does not matter.
         let enclosing = "* t\n.param tp=temper\nR1 a b tp\n";
         let alone = parse_netlist(enclosing, "ngspice");
         assert_eq!(alone.spice_blocks[0].params[0].value, "$temp");
 
         let inherited =
-            parse_netlist_with_inherited_names(enclosing, "ngspice", &["TEMPER".to_string()]);
+            parse_netlist_with_includes(enclosing, "ngspice", graph("f", &["TEMPER"], vec![]));
         let tp = inherited.spice_blocks[0]
             .params
             .iter()
@@ -2906,8 +3178,8 @@ ends adnfet\n";
     }
 
     #[test]
-    fn lib_entry_point_accepts_inherited_names() {
-        // The `.lib` entry point threads the inherited set as well.
+    fn lib_entry_point_accepts_include_graph() {
+        // The `.lib` entry point threads the graph's inherited names as well.
         let src = "\
 simulator lang=spectre\n\
 library global\n\
@@ -2919,12 +3191,324 @@ endlibrary global\n";
         assert_eq!(alone.params[0].value, "$temp");
 
         let inherited =
-            parse_netlist_lib_with_inherited_names(src, "tt", "spectre", &["temp".to_string()]);
+            parse_netlist_lib_with_includes(src, "tt", "spectre", graph("f", &["temp"], vec![]));
         assert_eq!(inherited.params[0].value, "temp");
     }
 
-    // --- Clause-gated parameters must never make a deck unloadable ---
+    // --- The v1..v11 matrix: conditional/included temperature declarations ---
 
+    /// The consumer's `spectre_temp_cond_scope.scs`, reproduced verbatim.
+    const COND_SCOPE_SRC: &str = "\
+simulator lang=spectre
+
+model resistor resistor
+model vsource vsource
+
+subckt nested_cond_temp a b
+  parameters sel=1 innerSel=1
+  if (sel==1) {
+    if (innerSel==1) {
+      parameters temp=50
+    }
+    parameters rval=temp*10
+  } else {
+    parameters rval=temp*10
+  }
+  r1 (a b) resistor r=rval
+ends nested_cond_temp
+
+subckt root_ref_temp a b
+  parameters sel=1 rval=temp*10
+  if (sel==1) {
+    parameters temp=50
+  }
+  r1 (a b) resistor r=rval
+ends root_ref_temp
+
+subckt included_cond_temp a b
+  parameters sel=1
+  if (sel==1) {
+    include \"spectre_temp_cond_decl.scs\"
+    parameters rval=temp*10
+  } else {
+    parameters rval=temp*10
+  }
+  r1 (a b) resistor r=rval
+ends included_cond_temp
+
+subckt later_include_temp a b
+  include \"spectre_temp_later_ref.scs\"
+  include \"spectre_temp_later_decl.scs\"
+  r1 (a b) resistor r=rval
+ends later_include_temp
+
+subckt ambient_temp a b
+  parameters rval=temp*10
+  r1 (a b) resistor r=rval
+ends ambient_temp
+
+subckt first_shared_temp a b
+  include \"spectre_temp_decl.scs\"
+  parameters rval=temp*10
+  r1 (a b) resistor r=rval
+ends first_shared_temp
+
+subckt second_shared_temp a b
+  include \"spectre_temp_decl.scs\"
+  parameters rval=temp*10
+  r1 (a b) resistor r=rval
+ends second_shared_temp
+";
+
+    /// The include graph the consumer resolves for `COND_SCOPE_SRC`: each
+    /// included file's declared names (definition-level vs clause-gated) and the
+    /// edges out of the file being projected.
+    fn cond_scope_graph() -> ffi::IncludeGraph {
+        graph(
+            "scope.scs",
+            &[],
+            vec![
+                with_includes(
+                    node("scope.scs", &[]),
+                    &[
+                        // `included_cond_temp`'s clause-level include.
+                        ("spectre_temp_cond_decl.scs", "", "cond_decl", true),
+                        ("spectre_temp_later_ref.scs", "", "later_ref", false),
+                        ("spectre_temp_later_decl.scs", "", "later_decl", false),
+                        ("spectre_temp_decl.scs", "", "shared_decl", false),
+                    ],
+                ),
+                // cond_decl file: `if (sel==1) { parameters temp=50 }`.
+                node_gated("cond_decl", &["temp"]),
+                // later_ref file: `parameters rval=temp+1`.
+                node("later_ref", &["rval"]),
+                // later_decl file: `parameters temp=100`.
+                node("later_decl", &["temp"]),
+                // shared decl file: `parameters temp=100`.
+                node("shared_decl", &["temp"]),
+            ],
+        )
+    }
+
+    fn val(params: &[ffi::Param], name: &str) -> String {
+        params
+            .iter()
+            .find(|p| p.name == name)
+            .unwrap_or_else(|| panic!("no parameter `{name}`"))
+            .value
+            .clone()
+    }
+
+    #[test]
+    fn spectre_temp_scope_matrix_v1_to_v11() {
+        let nl = parse_netlist_with_includes(COND_SCOPE_SRC, "spectre", cond_scope_graph());
+        assert_eq!(nl.subckts.len(), 7, "the deck must parse");
+        assert!(
+            nl.incompletes.is_empty(),
+            "no content may be dropped: {:?}",
+            nl.incompletes
+                .iter()
+                .map(|e| (e.start, e.end))
+                .collect::<Vec<_>>()
+        );
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        let sub = |name: &str| nl.subckts.iter().find(|s| s.name == name).unwrap();
+
+        // v1/v2/v7 (nested_cond_temp): the active nested clause declares `temp`,
+        // emitted as `$temp`, so `rval=$temp*10` is the ambient temperature when
+        // no clause binds it. Both clause bodies carry the SAME reference text.
+        let nested = sub("nested_cond_temp");
+        assert_eq!(nested.conditionals.len(), 1);
+        let nclauses = &nested.conditionals[0].clauses;
+        assert_eq!(nclauses.len(), 2);
+        // v1 (active, innerSel=1): the inner clause binds `$temp=50`.
+        let inner = &nclauses[0].body.conditionals[0].clauses[0].body;
+        assert_eq!(inner.params[0].name, "$temp");
+        assert_eq!(inner.params[0].value, "50");
+        // The active outer clause's reference.
+        assert_eq!(val(&nclauses[0].body.params, "rval"), "$temp*10");
+        // v2 (outer else): same reference, no `$temp` binding -> ambient.
+        assert_eq!(val(&nclauses[1].body.params, "rval"), "$temp*10");
+
+        // v8/v9 (root_ref_temp): the definition-level reference sees the
+        // clause-gated `temp` only as the ambient `$temp`.
+        let rootref = sub("root_ref_temp");
+        assert_eq!(val(&rootref.params, "rval"), "$temp*10");
+        assert_eq!(
+            rootref.conditionals[0].clauses[0].body.params[0].name,
+            "$temp"
+        );
+        assert_eq!(
+            rootref.conditionals[0].clauses[0].body.params[0].value,
+            "50"
+        );
+
+        // v3/v4 (included_cond_temp): a clause-level include shares the clause
+        // scope; its clause-gated `temp` does not shadow, so both branches
+        // reference the ambient `$temp`.
+        let included = sub("included_cond_temp");
+        let iclauses = &included.conditionals[0].clauses;
+        assert_eq!(iclauses[0].body.includes.len(), 1);
+        assert_eq!(
+            iclauses[0].body.includes[0].path,
+            "spectre_temp_cond_decl.scs"
+        );
+        assert_eq!(val(&iclauses[0].body.params, "rval"), "$temp*10");
+        assert_eq!(val(&iclauses[1].body.params, "rval"), "$temp*10");
+
+        // v5 (later_include_temp): both includes are definition-level; the
+        // declaration file is a SIBLING of the reference file, so the reference
+        // is projected separately with the scope's names (see the dedicated
+        // test below). The subckt itself keeps `r=rval` unrewritten.
+        let later = sub("later_include_temp");
+        assert_eq!(later.includes.len(), 2);
+        assert_eq!(later.instances[0].params[0].value, "rval");
+
+        // v6 (ambient_temp): NO include of its own, so a sibling subcircuit's
+        // include declaration must not leak in: the free `temp` is the ambient
+        // temperature.
+        assert_eq!(val(&sub("ambient_temp").params, "rval"), "$temp*10");
+
+        // v10/v11 (first_/second_shared_temp): each includes the shared file at
+        // definition level, so the declared `temp` shadows the builtin.
+        assert_eq!(val(&sub("first_shared_temp").params, "rval"), "temp*10");
+        assert_eq!(val(&sub("second_shared_temp").params, "rval"), "temp*10");
+    }
+
+    #[test]
+    fn spectre_include_graph_is_applied_per_scope_not_whole_file() {
+        // Two sibling subcircuits in one file: only the one that includes the
+        // declaration file sees its `temp`. The projection is a single pass over
+        // the file, so this is exactly the per-scope scoping the flat list could
+        // not express.
+        let src = "\
+simulator lang=spectre
+subckt with_include a b
+  include \"decl.scs\"
+  parameters rval=temp*10
+  r1 (a b) resistor r=rval
+ends with_include
+subckt without_include a b
+  parameters rval=temp*10
+  r1 (a b) resistor r=rval
+ends without_include
+";
+        let g = graph(
+            "f.scs",
+            &[],
+            vec![
+                with_includes(node("f.scs", &[]), &[("decl.scs", "", "decl", false)]),
+                node("decl", &["temp"]),
+            ],
+        );
+        let nl = parse_netlist_with_includes(src, "spectre", g);
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        let sub = |name: &str| nl.subckts.iter().find(|s| s.name == name).unwrap();
+        assert_eq!(
+            val(&sub("with_include").params, "rval"),
+            "temp*10",
+            "a subcircuit that includes the declaration sees `temp`"
+        );
+        assert_eq!(
+            val(&sub("without_include").params, "rval"),
+            "$temp*10",
+            "a sibling that includes nothing must not see it"
+        );
+    }
+
+    #[test]
+    fn spectre_nested_include_declarations_are_followed_through_the_graph() {
+        // The root includes `mid`, which declares nothing but includes `leaf` at
+        // definition level; `leaf` declares `temp`. The name is visible in the
+        // root's scope, so the root's reference keeps the declared binding.
+        let src = "\
+simulator lang=spectre
+include \"mid.scs\"
+parameters rval=temp*10
+";
+        let g = graph(
+            "f.scs",
+            &[],
+            vec![
+                with_includes(node("f.scs", &[]), &[("mid.scs", "", "mid", false)]),
+                with_includes(node("mid", &[]), &[("leaf.scs", "", "leaf", false)]),
+                node("leaf", &["temp"]),
+            ],
+        );
+        let nl = parse_netlist_with_includes(src, "spectre", g);
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        assert_eq!(val(&nl.params, "rval"), "temp*10");
+    }
+
+    #[test]
+    fn spectre_included_reference_sees_sibling_include_declaration() {
+        // v5: the reference lives in `later_ref.scs`, which itself has no include
+        // statement. The consumer projects it with `inherited = ["temp"]` (the
+        // names the sibling `later_decl.scs` makes visible in the merging scope),
+        // so `rval=temp+1` keeps the declared binding. Without that context the
+        // free `temp` is the ambient builtin.
+        let later_ref = "parameters rval=temp+1\n";
+        let with_scope = parse_netlist_with_includes(
+            later_ref,
+            "spectre",
+            graph("later_ref", &["temp"], vec![node("later_ref", &["rval"])]),
+        );
+        assert_eq!(val(&with_scope.params, "rval"), "temp+1");
+
+        let alone = parse_netlist_with_includes(
+            later_ref,
+            "spectre",
+            graph("later_ref", &[], vec![node("later_ref", &["rval"])]),
+        );
+        assert_eq!(val(&alone.params, "rval"), "$temp+1");
+    }
+
+    #[test]
+    fn spectre_clause_gated_temp_is_canonicalized_in_declaration_and_references() {
+        // A `temp` declared inside a conditional clause is emitted as `$temp`,
+        // and every free `temp` reference in the same clause namespace is
+        // rewritten to `$temp` exactly as if the declaration were absent. There
+        // is no `temp=$temp` double entry: the declaration IS the `$temp`.
+        let src = "\
+simulator lang=spectre
+subckt s a b
+  parameters sel=1
+  if (sel==1) {
+    parameters temp=50
+    parameters rval=temp*10
+  }
+  r1 (a b) resistor r=rval
+ends s
+";
+        let nl = parse_netlist(src, "spectre");
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        let body = &nl.subckts[0].conditionals[0].clauses[0].body;
+        assert_eq!(body.params[0].name, "$temp", "the declaration is `$temp`");
+        assert_eq!(body.params[0].value, "50");
+        assert_eq!(body.params[1].name, "rval");
+        assert_eq!(
+            body.params[1].value, "$temp*10",
+            "the reference in the clause namespace is `$temp` too"
+        );
+    }
+
+    #[test]
+    fn spectre_unconditional_declaration_does_not_shadow_via_clause_gate() {
+        // KEEP UNCHANGED: an UNCONDITIONAL `temp` declaration still suppresses
+        // the rewrite in the whole definition, so nothing becomes `$temp`.
+        let nl = parse_netlist(
+            "simulator lang=spectre\nparameters temp=300 y=temp+1\n",
+            "spectre",
+        );
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        assert_eq!(
+            nl.params.iter().find(|p| p.name == "temp").unwrap().name,
+            "temp"
+        );
+        assert_eq!(val(&nl.params, "y"), "temp+1");
+    }
+
+    // --- Clause-gated parameters must never make a deck unloadable ---
     #[test]
     fn spectre_unconditional_forward_reference_is_ordered() {
         // Definition-level `parameters`: a forward reference is still resolved

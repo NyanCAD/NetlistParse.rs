@@ -61,42 +61,60 @@ expression. The FFI struct shapes are unchanged — the order inside each `Vec` 
 the rewritten text are the only signals.
 
 Shadowing by a parameter declared in an **included** file is supported without
-the parser reading any file: the consumer resolves includes, collects the
-parameter names they declare, and passes them to
-`parse_netlist_with_inherited_names` (or, per section,
-`parse_netlist_lib_with_inherited_names`); a free `temp`/`temper` that matches an
-inherited name is left unrewritten. Inherited names follow the same case rule as
+the parser reading any file: the consumer resolves the include closure and hands
+the parser an include **graph** — for each file, the parameter names it declares
+(separating definition-level from clause-gated declarations) and its own nested
+includes — through `parse_netlist_with_includes` (or, per section,
+`parse_netlist_lib_with_includes`). The parser walks its OWN `include`
+statements and applies each included file's declarations in the scope where that
+statement sits: a definition-level include makes the file's unconditional names
+visible in the enclosing scope, following nested definition-level includes
+through the graph, while an include inside a conditional clause contributes only
+clause-gated names. A reference in an *included* file — which carries no
+`include` statement for its own includer — sees the merging scope's names through
+the graph's `inherited` list. A free `temp`/`temper` that matches a
+definition-level name is left unrewritten. Names follow the same case rule as
 every other declaration — case-sensitive for Spectre, case-folded for SPICE. The
 original `parse_netlist` / `parse_netlist_lib` entry points remain and default
-the inherited set to empty, so single-file callers are unaffected.
+the graph to empty, so single-file callers are unaffected.
 
 ## Known limitations of the builtin normalization
 
-The projection covers the common temperature-scope shapes — a free `temp`/`temper`
-shadowed by a declaration in the same definition, in one of its conditional
-clauses, or in the enclosing include chain (the last passed in explicitly, above)
-— and within those it needs no consumer-side scope re-derivation. It is **not** a
-complete equivalent of the consumer's old scope machinery. Two corners are
-deliberately out of scope, and a consumer that reaches them must resolve the name
-itself:
+The projection covers the temperature-scope shapes the consumer needs — a free
+`temp`/`temper` shadowed by a declaration in the same definition, by an
+unconditional declaration visible through an include in that scope, or (bound by
+the *active* clause of) a clause-gated declaration — with no consumer-side scope
+re-derivation and no `temp=$temp` style alias injection. In particular, the two
+corners the earlier flat inherited-name list could not express are now closed:
 
-1. **The inherited set is whole-file, so it cannot express per-subcircuit
-   namespaces.** The inherited-names argument is one flat list applied to the
-   whole projection. If an `include` local to subcircuit `s` declares `temp`,
-   that name should shadow the builtin only inside `s`. A single whole-file list
-   cannot express that: passing `temp` would wrongly shadow it in sibling
-   subcircuits, and omitting it would wrongly expose the builtin inside `s`.
-   Neither choice is correct for both, so scoped-to-one-subcircuit include
-   shadowing is not representable through `parse_netlist_with_inherited_names` /
-   `parse_netlist_lib_with_inherited_names`.
+1. **Per-subcircuit namespaces.** The include graph is applied in the scope where
+   each `include` sits, so a subcircuit that includes nothing never sees a
+   sibling subcircuit's include declarations.
+2. **Inactive-clause fallback.** A clause-gated `temp` declaration is
+   canonicalized to `$temp` (the declared NAME is emitted as `$temp`, and free
+   `temp` references in that namespace are rewritten to `$temp`) instead of
+   suppressing the rewrite, so a reference in an inactive clause falls back to
+   the ambient `$temp` and an active clause's `$temp` shadows it. No consumer
+   alias is needed.
 
-2. **A declaration in an *inactive* conditional clause still shadows.** A
-   clause-gated `temp` declaration joins the definition's namespace, so a free
-   `temp` elsewhere in the same definition is left spelled `temp` instead of being
-   rewritten to `$temp`. When that clause is not selected at run time, the
-   consumer's fixed-point resolver — which activates only the selected clauses —
-   never binds `temp`, and the reference is left unbound. The projection cannot
-   know which clauses are active, so it cannot avoid this.
+Two things remain out of scope, and a consumer that reaches them must still
+resolve the name itself:
+
+- **The rewrite is name-level, not an evaluator.** The parser never evaluates a
+  condition, so it cannot know which clause is active at run time; the fallback
+  relies on the consumer's contract that a parameter literally named `$temp`
+  shadows its ambient option. A construct whose `temp` visibility depends on
+  run-time state the graph does not describe is outside this model.
+- **The includer's scope is still passed as a flat list.** For a reference in an
+  *included* file, the names visible where that file is merged are supplied as
+  `IncludeGraph.inherited` — inherently flat, because the file has no `include`
+  statement for its own includer. The graph scopes the file's OWN includes; it
+  cannot derive the includer context. This is narrower than the old whole-file
+  list (it is one scope, not the whole closure) but it is not per-file scoped on
+  its own.
+
+The canonicalization is **Spectre-only** (`temp`); SPICE `temper` handling and
+clause semantics are unchanged, and ordering stays Spectre-only.
 
 ## FFI boundary
 
@@ -155,10 +173,11 @@ selects branches using the eventual instance parameters.
 Subcircuit-local `.include` and `.lib` directives retain their path and optional
 section in that subcircuit's `includes`. The parser does not read included files
 or deduplicate references across scopes. The consumer must resolve each include
-relative to its source file and in its defining scope, and may feed the parameter
-names those files declare back into the projection via
-`parse_netlist_with_inherited_names` / `parse_netlist_lib_with_inherited_names`
-so a declared `temp`/`temper` shadows the ambient-temperature builtin. As with
+relative to its source file and in its defining scope. For Spectre, the consumer
+can hand the resolved closure to `parse_netlist_with_includes` /
+`parse_netlist_lib_with_includes` as an include graph, so a `temp` a file's
+include declares shadows (or, clause-gated, is canonicalized to `$temp`)
+according to the include's own scope. As with
 the existing projection, statements are grouped by kind; order is preserved
 within each collection, not across different statement kinds.
 
