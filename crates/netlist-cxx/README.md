@@ -35,6 +35,16 @@ parameter list is emitted in dependency order (a true cycle is reported through
 `errors`). The FFI struct shapes are unchanged — the order inside each `Vec` and
 the rewritten text are the only signals.
 
+Shadowing by a parameter declared in an **included** file is supported without
+the parser reading any file: the consumer resolves includes, collects the
+parameter names they declare, and passes them to
+`parse_netlist_with_inherited_names` (or, per section,
+`parse_netlist_lib_with_inherited_names`); a free `temp`/`temper` that matches an
+inherited name is left unrewritten. Inherited names follow the same case rule as
+every other declaration — case-sensitive for Spectre, case-folded for SPICE. The
+original `parse_netlist` / `parse_netlist_lib` entry points remain and default
+the inherited set to empty, so single-file callers are unaffected.
+
 ## FFI boundary
 
 Rust has no stable ABI and cannot emit the C++ ABI, so the linkage boundary is
@@ -92,9 +102,12 @@ selects branches using the eventual instance parameters.
 Subcircuit-local `.include` and `.lib` directives retain their path and optional
 section in that subcircuit's `includes`. The parser does not read included files
 or deduplicate references across scopes. The consumer must resolve each include
-relative to its source file and in its defining scope. As with the existing
-projection, statements are grouped by kind; order is preserved within each
-collection, not across different statement kinds.
+relative to its source file and in its defining scope, and may feed the parameter
+names those files declare back into the projection via
+`parse_netlist_with_inherited_names` / `parse_netlist_lib_with_inherited_names`
+so a declared `temp`/`temper` shadows the ambient-temperature builtin. As with
+the existing projection, statements are grouped by kind; order is preserved
+within each collection, not across different statement kinds.
 
 Consumers must process these collections recursively, or reject constructs they
 cannot support; ignoring them can turn a valid device wrapper into an empty

@@ -255,9 +255,30 @@ mod ffi {
         /// of ngspice|hspice|pspice|xyce|spectre (case-insensitive). SPICE
         /// dialects use the SPICE parser; `spectre` uses the Spectre parser.
         fn parse_netlist(src: &str, language: &str) -> Netlist;
+        /// Like `parse_netlist`, but with `inherited_names` — the parameter
+        /// names declared in the enclosing file(s) and their include chain —
+        /// visible to the temperature-builtin shadowing. The parser reads no
+        /// files: the consumer resolves includes, collects the names they
+        /// declare, and passes them here. Matching is case-sensitive for
+        /// Spectre and case-folded for SPICE. An empty slice reproduces
+        /// `parse_netlist` exactly.
+        fn parse_netlist_with_inherited_names(
+            src: &str,
+            language: &str,
+            inherited_names: &[String],
+        ) -> Netlist;
         /// Parse a SPICE `.lib` file (dialect per `language`) and project only
         /// the named section. `language=spectre` is unsupported (errors).
         fn parse_netlist_lib(src: &str, section: &str, language: &str) -> Netlist;
+        /// Like `parse_netlist_lib`, with `inherited_names` visible to the
+        /// temperature-builtin shadowing (see
+        /// `parse_netlist_with_inherited_names`).
+        fn parse_netlist_lib_with_inherited_names(
+            src: &str,
+            section: &str,
+            language: &str,
+            inherited_names: &[String],
+        ) -> Netlist;
     }
 }
 
@@ -1247,8 +1268,12 @@ fn project_spice_block_children(
 }
 
 /// Project a `SPICENetlistSource` node into a `SpiceBlock`.
-fn project_spice_block(node: SyntaxNode, errors: &mut Vec<ffi::ParseError>) -> ffi::SpiceBlock {
-    project_spice_block_children(node.children(), &HashSet::new(), errors)
+fn project_spice_block(
+    node: SyntaxNode,
+    inherited: &HashSet<String>,
+    errors: &mut Vec<ffi::ParseError>,
+) -> ffi::SpiceBlock {
+    project_spice_block_children(node.children(), inherited, errors)
 }
 
 /// The definition-level content shared by a netlist and a subckt body.
@@ -1419,7 +1444,7 @@ fn collect_scope(
                 let mut inner = Vec::new();
                 collected
                     .spice_blocks
-                    .push(project_spice_block(stmt, &mut inner));
+                    .push(project_spice_block(stmt, scope, &mut inner));
                 errors.extend(inner);
             }
             _ => {}
@@ -1472,6 +1497,24 @@ fn resolve_lang(name: &str) -> Option<Lang> {
         "spectre" => Some(Lang::Spectre),
         _ => None,
     }
+}
+
+/// Build the projection's inherited-name set from a caller-supplied list,
+/// applying the dialect's case rule — the same rule `rewrite_temp` uses when it
+/// looks a name up: SPICE identifiers are case-folded (its `temper` match is
+/// case-insensitive), Spectre identifiers are kept verbatim (Spectre is
+/// case-sensitive). Exactly one set is allocated per projection call.
+fn inherited_names_set(names: &[String], spice: bool) -> HashSet<String> {
+    names
+        .iter()
+        .map(|n| {
+            if spice {
+                n.to_ascii_lowercase()
+            } else {
+                n.clone()
+            }
+        })
+        .collect()
 }
 
 /// A `Netlist` carrying a single synthetic parse error (byte range 0..0), used
@@ -1530,6 +1573,21 @@ fn netlist_from_scope(
 }
 
 pub fn parse_netlist(src: &str, language: &str) -> ffi::Netlist {
+    parse_netlist_with_inherited_names(src, language, &[])
+}
+
+/// Parse `src` with `inherited_names` — the parameter names declared in the
+/// enclosing file(s) and their include chain — visible to the projection's
+/// temperature-builtin shadowing. This is the additive entry point the consumer
+/// uses to reproduce cross-include shadowing without the parser reading files:
+/// the consumer resolves includes, collects the names they declare, and passes
+/// them here (cheap to call repeatedly — no file I/O, no global state, one set
+/// built per call). An empty slice is exactly `parse_netlist`.
+pub fn parse_netlist_with_inherited_names(
+    src: &str,
+    language: &str,
+    inherited_names: &[String],
+) -> ffi::Netlist {
     let (start_lang, dialect) = match resolve_lang(language) {
         // Spectre start: dialect is only consulted if a `simulator lang=spice`
         // region appears; Ngspice is the harmless default there.
@@ -1537,11 +1595,12 @@ pub fn parse_netlist(src: &str, language: &str) -> ffi::Netlist {
         Some(Lang::Spice(d)) => (StartLang::Spice, d),
         None => return lang_error_netlist(),
     };
+    let inherited = inherited_names_set(inherited_names, matches!(start_lang, StartLang::Spice));
     let root = parse_spectre_with(src, start_lang, dialect);
     let mut errors = collect_errors(&root);
     let incompletes = collect_incompletes(&root);
     let source = sast::SpectreNetlistSource::cast(root).expect("root is SpectreNetlistSource");
-    let scope = collect_scope(source.statements(), &HashSet::new(), &mut errors);
+    let scope = collect_scope(source.statements(), &inherited, &mut errors);
     netlist_from_scope(scope, errors, incompletes)
 }
 
@@ -1551,14 +1610,37 @@ pub fn parse_netlist(src: &str, language: &str) -> ffi::Netlist {
 /// (Spectre has no separate block type), so a consumer merges them into the
 /// current scope exactly as it would a flat Spectre netlist.
 pub fn parse_netlist_lib(src: &str, section: &str, language: &str) -> ffi::Netlist {
+    parse_netlist_lib_with_inherited_names(src, section, language, &[])
+}
+
+/// Like `parse_netlist_lib`, with `inherited_names` visible to the projection's
+/// temperature-builtin shadowing (see `parse_netlist_with_inherited_names`).
+pub fn parse_netlist_lib_with_inherited_names(
+    src: &str,
+    section: &str,
+    language: &str,
+    inherited_names: &[String],
+) -> ffi::Netlist {
     match resolve_lang(language) {
-        Some(Lang::Spice(dialect)) => parse_spice_lib(src, section, dialect),
-        Some(Lang::Spectre) => parse_spectre_lib(src, section),
+        Some(Lang::Spice(dialect)) => parse_spice_lib(
+            src,
+            section,
+            dialect,
+            &inherited_names_set(inherited_names, true),
+        ),
+        Some(Lang::Spectre) => {
+            parse_spectre_lib(src, section, &inherited_names_set(inherited_names, false))
+        }
         None => lang_error_netlist(),
     }
 }
 
-fn parse_spice_lib(src: &str, section: &str, dialect: Dialect) -> ffi::Netlist {
+fn parse_spice_lib(
+    src: &str,
+    section: &str,
+    dialect: Dialect,
+    inherited: &HashSet<String>,
+) -> ffi::Netlist {
     let root = parse_spice_dialect(src, dialect);
     let mut errors = collect_errors(&root);
     let incompletes = collect_incompletes(&root);
@@ -1576,11 +1658,8 @@ fn parse_spice_lib(src: &str, section: &str, dialect: Dialect) -> ffi::Netlist {
             if let Some(lib) = ast::LibStatement::cast(child) {
                 let name = tok_text(lib.name());
                 if name.eq_ignore_ascii_case(section) {
-                    let inner = project_spice_block_children(
-                        lib.statements(),
-                        &HashSet::new(),
-                        &mut errors,
-                    );
+                    let inner =
+                        project_spice_block_children(lib.statements(), inherited, &mut errors);
                     block.params.extend(inner.params);
                     block.models.extend(inner.models);
                     block.subckts.extend(inner.subckts);
@@ -1608,7 +1687,7 @@ fn spectre_section_matches(sec: &sast::Section, wanted: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn parse_spectre_lib(src: &str, section: &str) -> ffi::Netlist {
+fn parse_spectre_lib(src: &str, section: &str, inherited: &HashSet<String>) -> ffi::Netlist {
     let root = parse_spectre_with(src, StartLang::Spectre, Dialect::Ngspice);
     let mut errors = collect_errors(&root);
     let incompletes = collect_incompletes(&root);
@@ -1639,13 +1718,16 @@ fn parse_spectre_lib(src: &str, section: &str) -> ffi::Netlist {
         }
     }
 
-    let scope = collect_scope(selected.into_iter(), &HashSet::new(), &mut errors);
+    let scope = collect_scope(selected.into_iter(), inherited, &mut errors);
     netlist_from_scope(scope, errors, incompletes)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_netlist, parse_netlist_lib};
+    use super::{
+        parse_netlist, parse_netlist_lib, parse_netlist_lib_with_inherited_names,
+        parse_netlist_with_inherited_names,
+    };
 
     #[test]
     fn projects_spice_scoped_includes_and_nested_conditionals() {
@@ -2588,5 +2670,106 @@ ends adnfet\n";
             s.params.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
             ["w", "l", "rint", "cint"]
         );
+    }
+
+    // --- Inherited (enclosing include-chain) parameter names ---
+
+    #[test]
+    fn spectre_inherited_temp_shadows_builtin() {
+        // Two-file contract: the included file declares `temp`; the enclosing
+        // file's free `temp` must keep that binding, not become the ambient
+        // temperature builtin. With an empty inherited set it is the builtin.
+        let enclosing = "simulator lang=spectre\nparameters y=temp+1\n";
+        let alone = parse_netlist(enclosing, "spectre");
+        let y = alone.params.iter().find(|p| p.name == "y").unwrap();
+        assert_eq!(
+            y.value, "$temp+1",
+            "empty inherited set rewrites to builtin"
+        );
+
+        let inherited =
+            parse_netlist_with_inherited_names(enclosing, "spectre", &["temp".to_string()]);
+        let y = inherited.params.iter().find(|p| p.name == "y").unwrap();
+        assert_eq!(y.value, "temp+1", "inherited `temp` shadows the builtin");
+    }
+
+    #[test]
+    fn spectre_inherited_names_are_case_sensitive() {
+        // Spectre identifiers are case-sensitive: an inherited `TEMP` must not
+        // shadow the lowercase builtin `temp`.
+        let nl = parse_netlist_with_inherited_names(
+            "simulator lang=spectre\nparameters y=temp\n",
+            "spectre",
+            &["TEMP".to_string()],
+        );
+        assert_eq!(nl.params[0].value, "$temp");
+    }
+
+    #[test]
+    fn spectre_inherited_combines_with_local_declaration() {
+        // Inherited `temp` plus a locally declared `k` are both preserved in
+        // the same expression (the visible scope is their union).
+        let nl = parse_netlist_with_inherited_names(
+            "simulator lang=spectre\nparameters k=2 y=temp+k\n",
+            "spectre",
+            &["temp".to_string()],
+        );
+        let y = nl.params.iter().find(|p| p.name == "y").unwrap();
+        assert_eq!(y.value, "temp+k");
+    }
+
+    #[test]
+    fn spectre_inherited_combines_with_conditional_declaration() {
+        // A `temp` declared in a conditional clause joins the definition scope;
+        // an unrelated inherited name (`a`) is honoured at the same time.
+        let nl = parse_netlist_with_inherited_names(
+            "simulator lang=spectre\n\
+             parameters y=temp+a\n\
+             if (1) {\n\
+             parameters temp=1\n\
+             }\n",
+            "spectre",
+            &["a".to_string()],
+        );
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        let y = nl.params.iter().find(|p| p.name == "y").unwrap();
+        assert_eq!(y.value, "temp+a");
+    }
+
+    #[test]
+    fn spice_inherited_temper_shadows_builtin_case_folded() {
+        // SPICE equivalent: an include declares `temper`; the enclosing `.param`
+        // keeps the declared binding. The inherited name is case-folded, so its
+        // casing does not matter.
+        let enclosing = "* t\n.param tp=temper\nR1 a b tp\n";
+        let alone = parse_netlist(enclosing, "ngspice");
+        assert_eq!(alone.spice_blocks[0].params[0].value, "$temp");
+
+        let inherited =
+            parse_netlist_with_inherited_names(enclosing, "ngspice", &["TEMPER".to_string()]);
+        let tp = inherited.spice_blocks[0]
+            .params
+            .iter()
+            .find(|p| p.name == "tp")
+            .unwrap();
+        assert_eq!(tp.value, "temper", "inherited `temper` shadows the builtin");
+    }
+
+    #[test]
+    fn lib_entry_point_accepts_inherited_names() {
+        // The `.lib` entry point threads the inherited set as well.
+        let src = "\
+simulator lang=spectre\n\
+library global\n\
+section tt\n\
+parameters y=temp\n\
+endsection tt\n\
+endlibrary global\n";
+        let alone = parse_netlist_lib(src, "tt", "spectre");
+        assert_eq!(alone.params[0].value, "$temp");
+
+        let inherited =
+            parse_netlist_lib_with_inherited_names(src, "tt", "spectre", &["temp".to_string()]);
+        assert_eq!(inherited.params[0].value, "temp");
     }
 }
