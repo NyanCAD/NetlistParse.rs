@@ -488,6 +488,10 @@ fn expr_identifiers(text: &str) -> Vec<String> {
 ///
 /// Returns `Err(the input)` on a true cycle so the caller can surface it through
 /// the FFI `errors` field rather than dropping or silently reordering it.
+///
+/// Only *definition-level* (unconditional) lists are passed here. A conditional
+/// clause body's parameters are clause-gated and are deliberately never ordered
+/// — see `collect_scope` — so a cycle among them can never reach this function.
 fn order_params(params: Vec<ffi::Param>) -> Result<Vec<ffi::Param>, Vec<ffi::Param>> {
     let n = params.len();
     if n <= 1 {
@@ -611,7 +615,9 @@ fn project_block(
     inherited: &HashSet<String>,
     errors: &mut Vec<ffi::ParseError>,
 ) -> ffi::Block {
-    let scope = collect_scope(stmts, inherited, errors);
+    // A conditional clause body: `order = false`, so clause-gated parameters
+    // are never sorted and can never report a cycle (see `collect_scope`).
+    let scope = collect_scope(stmts, inherited, errors, false);
     ffi::Block {
         params: scope.params,
         models: scope.models,
@@ -654,7 +660,7 @@ fn project_subckt(
     inherited: &HashSet<String>,
     errors: &mut Vec<ffi::ParseError>,
 ) -> ffi::Subckt {
-    let scope = collect_scope(s.body(), inherited, errors);
+    let scope = collect_scope(s.body(), inherited, errors, true);
     ffi::Subckt {
         name: tok_text(s.name()),
         is_inline: s.is_inline(),
@@ -1125,7 +1131,7 @@ fn project_spice_conditional(
                     true,
                     scope,
                 ),
-                body: project_spice_block_children(clause.body(), scope, errors),
+                body: project_spice_block_children(clause.body(), scope, errors, false),
             })
             .collect(),
     }
@@ -1145,7 +1151,7 @@ fn project_spice_subckt(
     for p in &header {
         scope.insert(tok_text(p.name()).to_ascii_lowercase());
     }
-    let body = project_spice_block_children(s.body(), &scope, errors);
+    let body = project_spice_block_children(s.body(), &scope, errors, true);
     // Formal params first, then body `.param` statements, then ordered so each
     // expression follows the parameters it references.
     let mut params: Vec<ffi::Param> = header
@@ -1193,10 +1199,19 @@ fn collect_spice_param_names(children: &[SyntaxNode], out: &mut HashSet<String>)
 
 /// Project an iterator of SPICE children (params, models, subckts, devices,
 /// includes, conditionals) into a `SpiceBlock`.
+///
+/// `order` mirrors `collect_scope`: `true` at a definition level, where the
+/// unconditional `.param` list is dependency sorted and a true cycle is a real
+/// error; `false` inside a conditional clause body, whose `.param` names are
+/// clause-gated and resolved by the consumer (only the active clauses run), so
+/// they are left in source order and never report a cycle — the FFI `errors`
+/// channel is a bare span and cannot distinguish "harmless cycle in an
+/// unselected clause" from a genuine error.
 fn project_spice_block_children(
     children: impl Iterator<Item = SyntaxNode>,
     inherited: &HashSet<String>,
     errors: &mut Vec<ffi::ParseError>,
+    order: bool,
 ) -> ffi::SpiceBlock {
     let children: Vec<SyntaxNode> = children.collect();
     // `.param` declarations (including those inside `.if` clause bodies) are
@@ -1263,7 +1278,9 @@ fn project_spice_block_children(
             }
         }
     }
-    block.params = ordered(block.params, errors);
+    if order {
+        block.params = ordered(block.params, errors);
+    }
     block
 }
 
@@ -1273,7 +1290,7 @@ fn project_spice_block(
     inherited: &HashSet<String>,
     errors: &mut Vec<ffi::ParseError>,
 ) -> ffi::SpiceBlock {
-    project_spice_block_children(node.children(), inherited, errors)
+    project_spice_block_children(node.children(), inherited, errors, true)
 }
 
 /// The definition-level content shared by a netlist and a subckt body.
@@ -1333,10 +1350,25 @@ fn conditional_clause_bodies(c: &sast::ConditionalBlock) -> Vec<Vec<SyntaxNode>>
     bodies
 }
 
+/// Collect one Spectre scope's statements into a `Scope`.
+///
+/// CLAUSE-GATED PARAMETERS ARE NOT OURS TO SORT OR TO REJECT. `order` selects
+/// whether this scope's unconditional parameter list is fed to `order_params`:
+/// it is `true` at a *definition level* (a netlist, a `.subckt` body, a `.lib`
+/// section), where the static `parameters` list is meant to be dependency
+/// sorted and where a true cycle is a real error that must surface; it is
+/// `false` inside a conditional clause body. A clause's names are gated by that
+/// clause, and the consumer resolves such namespaces itself, evaluating only
+/// the *active* clauses — so a cycle between two names defined in an unselected
+/// clause is not an error, and the FFI `errors` channel is a bare span that
+/// cannot say "not really an error". Reporting one here would make a perfectly
+/// loadable deck unloadable. Clause-body parameters therefore stay in source
+/// order, untouched by `order_params`.
 fn collect_scope(
     stmts: impl Iterator<Item = SyntaxNode>,
     inherited: &HashSet<String>,
     errors: &mut Vec<ffi::ParseError>,
+    order: bool,
 ) -> Scope {
     let stmts: Vec<SyntaxNode> = stmts.collect();
 
@@ -1450,7 +1482,9 @@ fn collect_scope(
             _ => {}
         }
     }
-    collected.params = ordered(collected.params, errors);
+    if order {
+        collected.params = ordered(collected.params, errors);
+    }
     collected
 }
 
@@ -1600,7 +1634,7 @@ pub fn parse_netlist_with_inherited_names(
     let mut errors = collect_errors(&root);
     let incompletes = collect_incompletes(&root);
     let source = sast::SpectreNetlistSource::cast(root).expect("root is SpectreNetlistSource");
-    let scope = collect_scope(source.statements(), &inherited, &mut errors);
+    let scope = collect_scope(source.statements(), &inherited, &mut errors, true);
     netlist_from_scope(scope, errors, incompletes)
 }
 
@@ -1658,8 +1692,12 @@ fn parse_spice_lib(
             if let Some(lib) = ast::LibStatement::cast(child) {
                 let name = tok_text(lib.name());
                 if name.eq_ignore_ascii_case(section) {
-                    let inner =
-                        project_spice_block_children(lib.statements(), inherited, &mut errors);
+                    let inner = project_spice_block_children(
+                        lib.statements(),
+                        inherited,
+                        &mut errors,
+                        true,
+                    );
                     block.params.extend(inner.params);
                     block.models.extend(inner.models);
                     block.subckts.extend(inner.subckts);
@@ -1718,7 +1756,7 @@ fn parse_spectre_lib(src: &str, section: &str, inherited: &HashSet<String>) -> f
         }
     }
 
-    let scope = collect_scope(selected.into_iter(), inherited, &mut errors);
+    let scope = collect_scope(selected.into_iter(), inherited, &mut errors, true);
     netlist_from_scope(scope, errors, incompletes)
 }
 
@@ -2771,5 +2809,202 @@ endlibrary global\n";
         let inherited =
             parse_netlist_lib_with_inherited_names(src, "tt", "spectre", &["temp".to_string()]);
         assert_eq!(inherited.params[0].value, "temp");
+    }
+
+    // --- Clause-gated parameters must never make a deck unloadable ---
+
+    #[test]
+    fn spectre_unconditional_forward_reference_is_ordered() {
+        // Definition-level `parameters`: a forward reference is still resolved
+        // into dependency order.
+        let nl = parse_netlist(
+            "simulator lang=spectre\nparameters c=b*2 b=a*2 a=1\n",
+            "spectre",
+        );
+        assert!(nl.errors.is_empty(), "errors: {}", nl.errors.len());
+        assert_eq!(
+            nl.params
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
+    }
+
+    #[test]
+    fn spectre_unconditional_forward_cycle_is_reported() {
+        // A forward-referencing cycle among UNCONDITIONAL parameters is a real
+        // error and must still surface through the FFI `errors` field (the
+        // consumer relies on that signal), with the parameters kept.
+        let nl = parse_netlist(
+            "simulator lang=spectre\nparameters b=a*2 a=b*2\n",
+            "spectre",
+        );
+        assert!(
+            !nl.errors.is_empty(),
+            "an unconditional parameter cycle must surface through the FFI errors field"
+        );
+        assert_eq!(
+            nl.params
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["b", "a"]
+        );
+    }
+
+    #[test]
+    fn spectre_subckt_unconditional_cycle_is_reported() {
+        // The same guarantee at `.subckt` scope: definition-level parameters
+        // are ordered and a true cycle is reported.
+        let src = "\
+simulator lang=spectre
+subckt s a b
+parameters x=y*2 y=x*2
+r1 (a b) resistor r=1
+ends s
+";
+        let nl = parse_netlist(src, "spectre");
+        assert_eq!(nl.subckts.len(), 1, "the subckt must parse");
+        assert!(
+            nl.incompletes.is_empty(),
+            "no syntax incomplete: {:?}",
+            nl.incompletes
+                .iter()
+                .map(|e| (e.start, e.end))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !nl.errors.is_empty(),
+            "a subckt unconditional parameter cycle must surface"
+        );
+    }
+
+    #[test]
+    fn spectre_clause_gated_cycle_is_not_an_error() {
+        // The exact shape that regressed a consumer: a mutual cycle between two
+        // names lives inside a clause that is NOT selected, and both names are
+        // clause-gated. The consumer evaluates clause namespaces to a fixpoint
+        // over the ACTIVE clauses only, so this is not an error and must not be
+        // reported. The definition's unconditional parameters are still ordered.
+        let src = "\
+simulator lang=spectre
+subckt half in out
+  parameters sel=1 nested=1 after=rvalue
+  if (sel==1) {
+    if (nested==1) {
+      parameters branch=2
+    } else {
+      parameters branch=3
+    }
+    parameters rvalue=1k*branch
+  } else if (sel==0) {
+    parameters rvalue=4k
+  } else if (after<0) {
+    // The skipped clause's definitions must stay inactive.
+    parameters bad1=bad2 bad2=bad1 rvalue=missing_from_inactive_clause
+  } else {
+    parameters rvalue=missing_from_else_clause
+  }
+  r1 (in out) resistor r=rvalue
+ends half
+";
+        let nl = parse_netlist(src, "spectre");
+        assert_eq!(nl.subckts.len(), 1, "the deck must parse");
+        assert!(
+            nl.incompletes.is_empty(),
+            "the deck must parse without dropping content"
+        );
+        assert!(
+            nl.errors.is_empty(),
+            "a cycle in a clause-gated namespace must not make the deck unloadable; errors: {}",
+            nl.errors.len()
+        );
+        let sub = &nl.subckts[0];
+        // The unconditional list is still ordered (independent -> source order).
+        assert_eq!(
+            sub.params
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["sel", "nested", "after"]
+        );
+        // The inactive clause body's mutually-cyclic names stay in source order,
+        // untouched by `order_params`.
+        let clauses = &sub.conditionals[0].clauses;
+        assert_eq!(clauses.len(), 4);
+        assert_eq!(clauses[2].condition, "after<0");
+        let inactive = &clauses[2].body;
+        assert_eq!(
+            inactive
+                .params
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["bad1", "bad2", "rvalue"]
+        );
+    }
+
+    #[test]
+    fn spectre_clause_body_sibling_reference_is_not_an_error() {
+        // `x` in the `if` clause references `y`, defined in a sibling `else if`
+        // clause. Each clause is its own gated namespace, so neither the
+        // forward reference nor the split cycle is the parser's error to raise.
+        let src = "\
+simulator lang=spectre
+subckt s a b
+  parameters p=1
+  if (p==1) {
+    parameters x=y*2
+  } else if (p==0) {
+    parameters y=x*2
+  }
+  r1 (a b) resistor r=x
+ends s
+";
+        let nl = parse_netlist(src, "spectre");
+        assert_eq!(nl.subckts.len(), 1, "the deck must parse");
+        assert!(
+            nl.errors.is_empty(),
+            "cross-clause references must not be reported; errors: {}",
+            nl.errors.len()
+        );
+        // Clause bodies are left untouched: source order preserved.
+        let clauses = &nl.subckts[0].conditionals[0].clauses;
+        assert_eq!(clauses[0].body.params[0].name, "x");
+        assert_eq!(clauses[1].body.params[0].name, "y");
+    }
+
+    #[test]
+    fn spice_clause_gated_cycle_is_not_an_error() {
+        // SPICE equivalent: a `.if` clause body holds a mutual `.param` cycle
+        // and a reference to a sibling clause; neither is an error, while the
+        // definition-level `.param`s are still ordered.
+        let src = "* t\n\
+                   .subckt s a b\n\
+                   .param sel=1\n\
+                   .if (sel==1)\n\
+                   .param bad1=bad2\n\
+                   .param bad2=bad1\n\
+                   .param rvalue=bad1\n\
+                   .else\n\
+                   .param other=missing_from_else\n\
+                   .endif\n\
+                   R1 a b rvalue\n\
+                   .ends\n";
+        let nl = parse_netlist(src, "ngspice");
+        assert!(
+            nl.errors.is_empty(),
+            "a SPICE clause-gated cycle must not be reported; errors: {}",
+            nl.errors.len()
+        );
+        let sub = &nl.spice_blocks[0].subckts[0];
+        assert_eq!(
+            sub.params
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["sel"]
+        );
     }
 }

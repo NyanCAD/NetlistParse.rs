@@ -31,9 +31,14 @@ re-parses them with its own expression engine. Two dialect normalizations are
 applied first, using the parser's own scope knowledge so the consumer needs no
 post-parse scope tracking: the ambient-temperature builtin is canonicalized to
 `$temp` (Spectre free `temp`, SPICE free `temper`), and each definition's
-parameter list is emitted in dependency order (a true cycle is reported through
-`errors`). The FFI struct shapes are unchanged — the order inside each `Vec` and
-the rewritten text are the only signals.
+**unconditional** parameter list is emitted in dependency order (a true cycle
+among unconditional parameters is reported through `errors`). Parameters that
+live inside conditional clauses are left in source order and never report a
+cycle: the consumer resolves clause-gated namespaces itself and evaluates only
+the active clauses, so a cycle between names defined in an unselected clause is
+not an error — and the FFI `errors` channel is a bare span that cannot say
+"not really an error". The FFI struct shapes are unchanged — the order inside
+each `Vec` and the rewritten text are the only signals.
 
 Shadowing by a parameter declared in an **included** file is supported without
 the parser reading any file: the consumer resolves includes, collects the
